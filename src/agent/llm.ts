@@ -78,6 +78,16 @@ function templateFallback(facts: TurnFacts): string {
         .join("; ");
       return `Here's what you have booked: ${list}.`;
     }
+    case "confirm_reschedule":
+      return `You have an appointment with Dr. ${d.doctorName} on ${d.date} at ${d.time}. Would you like me to cancel this one so we can book a new time?`;
+    case "reschedule_select_date":
+      return `Alright, that's cancelled. Dr. ${d.doctorName} is available on: ${d.dates.join(", ")}. Which date would you like for the new appointment?`;
+    case "ask_which_to_reschedule":
+      return `You have ${(d.appointments as any[]).length} upcoming appointments. Which one would you like to reschedule?`;
+    case "no_appointments_retry":
+      return d?.context === "reschedule"
+        ? "I don't see any upcoming appointments under that number. Could you double-check the phone number?"
+        : "I don't see any upcoming appointments under that number. Would you like to try a different number?";
     case "no_appointments":
       return "I don't see any upcoming appointments under that number.";
     case "ask_which_to_cancel":
@@ -119,8 +129,13 @@ const DETERMINISTIC_ONLY_ACTIONS = new Set<TurnFacts["action"]>([
   "cancellation_success",
   "list_appointments",
   "no_appointments",
+  "no_appointments_retry",           // ← ADD
   "date_unavailable",
   "time_unavailable",
+  "confirm_reschedule",
+  "reschedule_select_date",
+  "ask_which_to_reschedule",
+  "ask_which_to_cancel",
 ]);
 
 // Extra safety net for the remaining (lower-stakes, more conversational)

@@ -1,5 +1,7 @@
 import { DoctorRecord, SlotRecord } from "./types";
-
+import { and, eq, ilike } from "drizzle-orm";
+import { db } from "../db/client";
+import { doctors } from "../db/schema";
 // ---------------------------------------------------------------------------
 // Ordinal helpers
 // ---------------------------------------------------------------------------
@@ -105,7 +107,39 @@ function monthIndexFromToken(token: string): number {
 export function containsMonthMention(text: string): boolean {
   return MONTH_MENTION_RE.test(text);
 }
+export function extractDoctorNameQuery(text: string): string | null {
+  const t = text.trim();
 
+  const directDoctorMatch = t.match(
+    /\b(?:dr\.?|doctor)\s+([a-z][a-z .'-]{1,80})/i
+  );
+
+  if (directDoctorMatch) {
+    return cleanDoctorNameQuery(directDoctorMatch[1]);
+  }
+
+  const withDoctorMatch = t.match(
+    /\b(?:with|see|visit|book(?: an)? appointment with)\s+(?:dr\.?|doctor)?\s*([a-z][a-z .'-]{1,80})/i
+  );
+
+  if (withDoctorMatch) {
+    return cleanDoctorNameQuery(withDoctorMatch[1]);
+  }
+
+  return null;
+}
+
+function cleanDoctorNameQuery(raw: string): string | null {
+  const cleaned = raw
+    .replace(
+      /\b(?:appointment|booking|book|schedule|please|today|tomorrow|on|at|for)\b.*$/i,
+      ""
+    )
+    .replace(/[^\w\s.'-]/g, "")
+    .trim();
+
+  return cleaned.length >= 2 ? cleaned : null;
+}
 /** Parse an explicit calendar date mention ("12th of July", "July 5th", "5 Jul") into an ISO date string. */
 export function parseCalendarDateMention(text: string, reference: Date = new Date()): string | null {
   let day: number | null = null;
@@ -204,7 +238,22 @@ function to12Hour(hour: number, minute: number): string {
   const hour12 = hour % 12 === 0 ? 12 : hour % 12;
   return `${hour12}:${String(minute).padStart(2, "0")} ${period}`;
 }
+export async function searchDoctorsByName(nameQuery: string) {
+  const q = nameQuery.replace(/^dr\.?\s+/i, "").trim();
 
+  if (!q) return [];
+
+  return db
+    .select()
+    .from(doctors)
+    .where(
+      and(
+        eq(doctors.active, true),
+        ilike(doctors.name, `%${q}%`)
+      )
+    )
+    .limit(5);
+}
 /** Resolve which time slot the user meant: exact time match first, else ordinal position. */
 export function resolveTimeSelection(userText: string, slots: SlotRecord[]): TimeResolutionResult {
   // Normalize "p.m." / "a.m." -> "pm" / "am" so both forms are recognized.

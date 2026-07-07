@@ -15,11 +15,13 @@ export type ConversationStage =
   | "checking_appointments"
   | "cancelling_select_appointment"
   | "cancelling_confirm"
+  | "rescheduling_lookup"
   | "done";
 
 export type Intent =
   | "greeting"
   | "symptom_or_specialization_query"
+  | "reschedule_appointment"
   | "doctor_selection"
   | "date_selection"
   | "time_selection"
@@ -64,6 +66,14 @@ export interface ConversationSession {
   createdAt: string;
   updatedAt: string;
 
+  phonePurpose?: "booking" | "lookup" | "cancel" | "reschedule";
+  rescheduleContext?: {
+    doctorId: number;
+    doctorName: string;
+    patientPhone: string;
+  };
+  appointmentToCancelId?: number;
+
   // accumulated deterministic state — the "form" being filled in
   symptomText?: string;
   specialization?: string;
@@ -81,9 +91,12 @@ export interface ConversationSession {
   lastAppointments?: Array<{
     appointmentId: number;
     doctorName: string;
+    doctorId?: number;
     date: string;
     time: string;
     status: string;
+    // ADD THIS - needed for reschedule context
+
   }>;
 }
 
@@ -99,27 +112,33 @@ export interface TurnFacts {
   stage: ConversationStage;
   nextStage: ConversationStage;
   action:
-    | "ask_symptom"
-    | "list_doctors"
-    | "ask_doctor_choice"
-    | "list_dates"
-    | "ask_date_choice"
-    | "list_slots"
-    | "ask_time_choice"
-    | "date_unavailable"
-    | "time_unavailable"
-    | "ask_change_target"
-    | "ask_name"
-    | "ask_phone"
-    | "confirm_booking_details"
-    | "booking_success"
-    | "booking_failed"
-    | "list_appointments"
-    | "no_appointments"
-    | "ask_which_to_cancel"
-    | "confirm_cancellation"
-    | "cancellation_success"
-    | "clarify_unknown"
-    | "goodbye";
+  | "ask_symptom"
+  | "list_doctors"
+  | "ask_doctor_choice"
+  | "list_dates"
+  | "ask_date_choice"
+  | "list_slots"
+  | "ask_time_choice"
+  | "date_unavailable"
+  | "time_unavailable"
+  | "ask_change_target"
+  | "ask_name"
+  | "ask_phone"
+  | "confirm_booking_details"
+  | "booking_success"
+  | "booking_failed"
+  | "list_appointments"
+  | "no_appointments"
+  | "no_appointments_retry"      // ADD
+  | "ask_which_to_reschedule"    // ADD
+
+  | "ask_which_to_cancel"
+  | "confirm_cancellation"
+  | "confirm_reschedule"         // ADD
+  | "reschedule_select_date"     // ADD
+
+  | "cancellation_success"
+  | "clarify_unknown"
+  | "goodbye";
   data: Record<string, unknown>;
 }

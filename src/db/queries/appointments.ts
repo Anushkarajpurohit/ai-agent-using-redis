@@ -85,6 +85,7 @@ export async function getUpcomingAppointmentsByPhone(phone: string) {
       appointmentId: appointments.id,
       status: appointments.status,
       doctorName: doctors.name,
+      doctorId: doctors.id,
       specialization: doctors.specialization,
       slotDate: doctorSlots.slotDate,
       startTime: doctorSlots.startTime,

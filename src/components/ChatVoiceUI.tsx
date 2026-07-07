@@ -52,7 +52,7 @@ export default function ChatVoiceUI() {
   // SpeechRecognition.onresult closure — created in its own mount-only
   // effect — permanently captured the initial empty string, causing every
   // voice turn to send sessionId="" to /api/chat.
-  const [sessionId, setSessionId] = useState("");
+  const [sessionId] = useState(() => getOrCreateSessionId());
   const [speechSupported, setSpeechSupported] = useState(true);
   const recognitionRef = useRef<any>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -66,9 +66,7 @@ export default function ChatVoiceUI() {
   // requiring a tap for every single turn. Tapping the orb while listening
   // manually "hangs up" (turns this back off).
   const callActiveRef = useRef(false);
-  useEffect(() => {
-    setSessionId(getOrCreateSessionId());
-  }, []);
+
   useEffect(() => {
     const SpeechRecognitionCtor =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;

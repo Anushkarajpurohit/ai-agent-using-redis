@@ -60,28 +60,80 @@ function memoryGet(key: string): string | null {
 function memorySet(key: string, value: string, ttlSeconds: number) {
   memoryStore.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
 }
+function memoryTtlSeconds(key: string): number {
+  const entry = memoryStore.get(key);
+  if (!entry) return 1;
+  return Math.max(1, Math.ceil((entry.expiresAt - Date.now()) / 1000));
+}
+
+function isSessionKey(key: string) {
+  return key.startsWith("session:");
+}
+
+function updatedAtMs(value: any): number {
+  if (!value || typeof value !== "object") return 0;
+  if (!value.updatedAt) return 0;
+
+  const parsed = Date.parse(value.updatedAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 export async function cacheGet<T>(key: string): Promise<T | null> {
   const redis = getRedis();
+
+  const memoryRaw = memoryGet(key);
+  const memoryValue = memoryRaw ? JSON.parse(memoryRaw) : null;
+
   if (redis && redisReady) {
     try {
-      const raw = await redis.get(key);
-      if (raw) {
+      const redisRaw = await redis.get(key);
+
+      if (redisRaw) {
+        const redisValue = JSON.parse(redisRaw);
+
+        // Critical for your bug:
+        // If the first turn wrote to memory before Redis became ready,
+        // memory may be newer than Redis.
+        if (memoryValue && isSessionKey(key)) {
+          const memTime = updatedAtMs(memoryValue);
+          const redisTime = updatedAtMs(redisValue);
+
+          if (memTime >= redisTime) {
+            console.log(`[CACHE HIT] (memory-newer-than-redis) ${key}`);
+
+            await redis.set(key, memoryRaw!, "EX", memoryTtlSeconds(key));
+            console.log(`[CACHE SET] (redis backfill) ${key}`);
+
+            return memoryValue as T;
+          }
+        }
+
         console.log(`[CACHE HIT] (redis) ${key}`);
-        return JSON.parse(raw) as T;
+        return redisValue as T;
       }
+
       console.log(`[CACHE MISS] (redis) ${key}`);
+
+      if (memoryValue) {
+        console.log(`[CACHE HIT] (memory-after-redis-miss) ${key}`);
+
+        await redis.set(key, memoryRaw!, "EX", memoryTtlSeconds(key));
+        console.log(`[CACHE SET] (redis backfill) ${key}`);
+
+        return memoryValue as T;
+      }
+
       return null;
     } catch (err) {
       console.warn(`[CACHE] redis.get failed for ${key}, falling back to memory`, err);
     }
   }
 
-  const raw = memoryGet(key);
-  if (raw) {
+  if (memoryValue) {
     console.log(`[CACHE HIT] (memory) ${key}`);
-    return JSON.parse(raw) as T;
+    return memoryValue as T;
   }
+
   console.log(`[CACHE MISS] (memory) ${key}`);
   return null;
 }
@@ -92,18 +144,21 @@ export async function cacheSet(
   ttlSeconds: number
 ): Promise<void> {
   const serialized = JSON.stringify(value);
+
+  // Always write memory first.
+  memorySet(key, serialized, ttlSeconds);
+  console.log(`[CACHE SET] (memory) ${key} ttl=${ttlSeconds}s`);
+
   const redis = getRedis();
+
   if (redis && redisReady) {
     try {
       await redis.set(key, serialized, "EX", ttlSeconds);
       console.log(`[CACHE SET] (redis) ${key} ttl=${ttlSeconds}s`);
-      return;
     } catch (err) {
-      console.warn(`[CACHE] redis.set failed for ${key}, writing to memory instead`, err);
+      console.warn(`[CACHE] redis.set failed for ${key}, memory already updated`, err);
     }
   }
-  memorySet(key, serialized, ttlSeconds);
-  console.log(`[CACHE SET] (memory) ${key} ttl=${ttlSeconds}s`);
 }
 
 export async function cacheDel(key: string): Promise<void> {

@@ -9,13 +9,14 @@ import { containsMonthMention, parseCalendarDateMention } from "./selectors";
  * (e.g. "the second one" is a doctor choice in one stage and a time choice
  * in another). This keeps the LLM completely out of the routing decision.
  */
-
+const BARE_GREETING_RE =
+  /^(hi|hello|hey|good morning|good afternoon|good evening)[\s!.]*$/i;
 const GREETING_RE = /\b(hi|hello|hey|good (morning|afternoon|evening))\b/i;
 const GOODBYE_RE = /\b(bye|goodbye|that'?s all|no thanks|nothing else|thank you,? bye)\b/i;
 const YES_RE = /\b(yes|yeah|yup|correct|confirm|sounds good|book it|go ahead|sure)\b/i;
 const NO_RE = /\b(no|nope|cancel that|not this one|change|different)\b/i;
-const CHECK_APPTS_RE = /\b(my appointments?|existing booking|check.*(booking|appointment)|do i have (an|any) appointment)\b/i;
-const RESCHEDULE_RE = /\breschedul(e|ing)\b/i;
+const CHECK_APPTS_RE =
+  /\b(check|view|see|show|list|look\s*up|find|get)\b[\s\S]{0,80}\b(upcoming\s+|future\s+)?appointments?\b|\b(upcoming|future)\s+appointments?\b|\bmy\s+(upcoming\s+|future\s+)?appointments?\b/i; const RESCHEDULE_RE = /\breschedul(e|ing)\b/i;
 const CANCEL_RE = /\bcancel\b/i;
 const PHONE_RE = /\b\d{10}\b|\+?\d[\d\s-]{7,14}\d\b/;
 const ORDINAL_RE = /\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b/i;
@@ -27,12 +28,15 @@ export function classifyIntent(userText: string, stage: ConversationStage): Inte
   const text = userText.trim();
 
   if (GOODBYE_RE.test(text)) return "goodbye";
+  if (BARE_GREETING_RE.test(text) && stage === "greeting") {
+    return "greeting";
+  }
+  if (RESCHEDULE_RE.test(text)) return "reschedule_appointment";
   if (GREETING_RE.test(text) && stage === "greeting") return "greeting";
   // "reschedule" must be checked before the check-appointments regex, since
   // "reschedule my appointment" also matches "my appointment" and was being
   // misclassified as a read-only lookup (producing confused LLM output with
   // no actual reschedule flow behind it).
-  if (RESCHEDULE_RE.test(text)) return "cancel_appointment";
   if (CHECK_APPTS_RE.test(text)) return "check_appointments";
   if (CANCEL_RE.test(text)) return "cancel_appointment";
 

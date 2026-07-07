@@ -1,3 +1,4 @@
+// orchestrator.tsx
 import { classifyIntent } from "./intent-classifier";
 import { resolveSpecialization } from "./specialization-map";
 import {
@@ -6,6 +7,7 @@ import {
   resolveTimeSelection,
   extractValidName,
   extractValidPhone,
+  extractDoctorNameQuery
 } from "./selectors";
 import { loadSession, saveSession } from "./session-store";
 import { phraseResponse } from "./llm";
@@ -16,13 +18,10 @@ import {
   cancelAppointment,
   getUpcomingAppointmentsByPhone,
 } from "../db/queries/appointments";
-import { ConversationSession, TurnFacts } from "./types";
-
+import { ConversationSession, TurnFacts, Intent } from "./types";
 export interface OrchestratorResult {
   reply: string;
   stage: ConversationSession["stage"];
-  // UI-friendly structured options so the frontend can also render buttons,
-  // not just rely on voice — same deterministic data the LLM was given.
   options?: Record<string, unknown>;
 }
 
@@ -37,42 +36,157 @@ function formatTimeLabel(hhmmss: string): string {
   const hour12 = h % 12 === 0 ? 12 : h % 12;
   return `${hour12}:${String(m).padStart(2, "0")} ${period}`;
 }
+function forceGlobalIntent(
+  text: string,
+  stage: ConversationSession["stage"],
+  classified: Intent
+): Intent {
+  const t = text.toLowerCase();
 
+  const mentionsAppointment = /\bappointments?\b/.test(t);
+  const wantsLookup = mentionsAppointment && /\b(check|view|see|show|list|look\s*up|find|get|upcoming|future)\b/.test(t);
+  const wantsCancel = mentionsAppointment && /\b(cancel|delete|remove)\b/.test(t);
+  const wantsReschedule = /\breschedul(e|ing)\b/i.test(t);
+
+  // CRITICAL FIX: Do not restart reschedule flow if we are already inside it.
+  // Stages that belong to an in-progress reschedule/cancel/booking flow should
+  // be preserved — otherwise the user gets stuck in a loop being asked for
+  // their phone number again and again.
+  const inActiveFlow =
+    stage === "awaiting_patient_phone" ||
+    stage === "awaiting_date_selection" ||
+    stage === "awaiting_time_selection" ||
+    stage === "awaiting_patient_name" ||
+    stage === "awaiting_confirmation" ||
+    stage === "cancelling_select_appointment" ||
+    stage === "cancelling_confirm";
+
+  if (wantsReschedule && !inActiveFlow) return "reschedule_appointment";
+  if (wantsCancel && !inActiveFlow) return "cancel_appointment";
+  if (wantsLookup && !inActiveFlow) return "check_appointments";
+
+  if (stage !== "cancelling_confirm" && wantsCancel && !inActiveFlow) {
+    if (/\b(don'?t|do not|never|abort|stop)\b/i.test(t) && /\bcancel\b/i.test(t)) {
+      return "confirm_no";
+    }
+    if (/\b(yes|yeah|sure|ok|okay|confirm)\b/i.test(t)) return "confirm_yes";
+    if (/\b(no|nope)\b/i.test(t)) return "confirm_no";
+  }
+
+  return classified;
+}
+
+function clearBookingDraft(session: ConversationSession) {
+  delete session.symptomText;
+  delete session.specialization;
+  delete session.candidateDoctors;
+  delete session.selectedDoctorId;
+  delete session.selectedDoctorName;
+  delete session.availableDates;
+  delete session.selectedDate;
+  delete session.availableSlotsForDate;
+  delete session.selectedSlotId;
+  delete session.selectedSlotTime;
+  delete session.patientName;
+  delete session.reasonForVisit;
+}
 export async function handleTurn(
   sessionId: string,
   userText: string
 ): Promise<OrchestratorResult> {
   const session = await loadSession(sessionId);
-  const intent = classifyIntent(userText, session.stage);
 
-  console.log(`[ORCHESTRATOR] session=${sessionId} stage=${session.stage} intent=${intent} text="${userText}"`);
+  const rawIntent = classifyIntent(userText, session.stage);
+  const intent = forceGlobalIntent(userText, session.stage, rawIntent);
+
+  console.log(
+    `[ORCHESTRATOR] session=${sessionId} stage=${session.stage} rawIntent=${rawIntent} intent=${intent} text="${userText}"`
+  );
 
   let facts: TurnFacts;
+  const inActiveFlow =
+    session.stage === "awaiting_patient_phone" ||
+    session.stage === "awaiting_date_selection" ||
+    session.stage === "awaiting_time_selection" ||
+    session.stage === "awaiting_patient_name" ||
+    session.stage === "awaiting_confirmation" ||
+    session.stage === "cancelling_select_appointment" ||
+    session.stage === "cancelling_confirm";
+  const inCancellationFlow =
+    session.stage === "cancelling_select_appointment" ||
+    session.stage === "cancelling_confirm";
 
-  // Stages where a cancel/check-appointments flow is already in progress.
-  // "cancel" or "appointment" appearing in the user's text here (e.g. "yes
-  // cancel it" while confirming) must NOT restart the whole flow from
-  // scratch — that was the exact bug that made cancellation loop forever,
-  // re-asking for the phone number every single turn.
-  const midFlowStages = new Set<ConversationSession["stage"]>([
-    "awaiting_patient_phone",
-    "cancelling_select_appointment",
-    "cancelling_confirm",
-  ]);
-  const alreadyMidFlow = midFlowStages.has(session.stage);
-
-  // -------------------------------------------------------------------
-  // Global intents that can interrupt almost any stage
-  // -------------------------------------------------------------------
   if (intent === "goodbye") {
-    facts = { intent, stage: session.stage, nextStage: "done", action: "goodbye", data: {} };
     session.stage = "done";
+
+    facts = {
+      intent,
+      stage: session.stage,
+      nextStage: "done",
+      action: "goodbye",
+      data: {},
+    };
+  } else if (intent === "check_appointments") {
+    clearBookingDraft(session);
+
+    session.stage = "awaiting_patient_phone";
+    session.phonePurpose = "lookup";
+
+    delete (session as any)._phoneReasonIsLookup;
+    delete (session as any)._phoneReasonIsCancel;
+
+    facts = {
+      intent,
+      stage: "checking_appointments",
+      nextStage: "awaiting_patient_phone",
+      action: "ask_phone",
+      data: { purpose: "lookup" },
+    };
+  } else if (intent === "reschedule_appointment" && !inActiveFlow) {
+    clearBookingDraft(session);
+    session.stage = "awaiting_patient_phone";
+    session.phonePurpose = "reschedule";
+
+    facts = {
+      intent,
+      stage: "rescheduling_lookup",
+      nextStage: "awaiting_patient_phone",
+      action: "ask_phone",
+      data: { purpose: "reschedule" },
+    };
+
+    // } else if (intent === "reschedule_appointment" && !inCancellationFlow) {
+
+    //   clearBookingDraft(session);
+    //   session.stage = "awaiting_patient_phone";
+    //   session.phonePurpose = "reschedule";  // NEW distinct purpose
+
+    //   facts = {
+    //     intent,
+    //     stage: "rescheduling_lookup",
+    //     nextStage: "awaiting_patient_phone",
+    //     action: "ask_phone",
+    //     data: { purpose: "reschedule" },
+    //   };
+  } else if (intent === "cancel_appointment" && !inActiveFlow) {
+    clearBookingDraft(session);
+
+    session.stage = "awaiting_patient_phone";
+    session.phonePurpose = "cancel";
+
+    delete (session as any)._phoneReasonIsLookup;
+    delete (session as any)._phoneReasonIsCancel;
+
+    facts = {
+      intent,
+      stage: "cancelling_select_appointment",
+      nextStage: "awaiting_patient_phone",
+      action: "ask_phone",
+      data: { purpose: "cancel" },
+    };
   } else if (intent === "greeting" && !resolveSpecialization(userText).confident) {
-    // A bare "hello Maya, how are you?" has no medical content — respond
-    // with a plain greeting instead of silently defaulting to a
-    // "general medicine" DB search (which was firing on every hello and,
-    // if that specialization happened to be empty, made it look broken).
     session.stage = "awaiting_symptom_or_request";
+
     facts = {
       intent,
       stage: "greeting",
@@ -80,17 +194,6 @@ export async function handleTurn(
       action: "ask_symptom",
       data: {},
     };
-  } else if (intent === "check_appointments" && !alreadyMidFlow) {
-    session.stage = "checking_appointments";
-    facts = { intent, stage: session.stage, nextStage: "awaiting_patient_phone", action: "ask_phone", data: {} };
-    session.stage = "awaiting_patient_phone";
-    // tag why we're asking for the phone number this time
-    (session as any)._phoneReasonIsLookup = true;
-  } else if (intent === "cancel_appointment" && !alreadyMidFlow) {
-    session.stage = "cancelling_select_appointment";
-    facts = { intent, stage: session.stage, nextStage: "awaiting_patient_phone", action: "ask_phone", data: {} };
-    session.stage = "awaiting_patient_phone";
-    (session as any)._phoneReasonIsCancel = true;
   } else {
     facts = await routeByStage(session, intent, userText);
   }
@@ -99,7 +202,23 @@ export async function handleTurn(
 
   const reply = await phraseResponse(facts);
 
-  return { reply, stage: session.stage, options: facts.data };
+  return {
+    reply,
+    stage: session.stage,
+    options: facts.data,
+  };
+}
+// Utility to clear session state when switching context
+function cleanupBookingState(session: ConversationSession) {
+  delete session.selectedDoctorId;
+  delete session.selectedDoctorName;
+  delete session.selectedDate;
+  delete session.selectedSlotId;
+  delete session.selectedSlotTime;
+  delete session.patientName;
+  delete session.patientPhone;
+  delete session.availableDates;
+  delete session.availableSlotsForDate;
 }
 
 async function routeByStage(
@@ -110,15 +229,42 @@ async function routeByStage(
   switch (session.stage) {
     case "greeting":
     case "awaiting_symptom_or_request": {
+      // Allow searching directly by a doctor's name if they said "I want to book Dr. Kapoor"
       const { specialization, matchedKeyword, confident } = resolveSpecialization(userText);
+
       session.symptomText = userText;
       session.specialization = specialization;
 
       const doctors = await getDoctorsBySpecialization(specialization);
       session.candidateDoctors = doctors;
 
+      // Escape hatch: check if they typed/spoke a doctor's name directly
+      const directDocMatch = resolveDoctorSelection(userText, doctors);
+      if (directDocMatch) {
+        session.selectedDoctorId = directDocMatch.id;
+        session.selectedDoctorName = directDocMatch.name;
+
+        const week = await getDoctorWeekAvailability(directDocMatch.id);
+        const availableDates = Object.keys(week.slotsByDate).filter(
+          (d) => week.slotsByDate[d].length > 0
+        );
+        session.availableDates = availableDates;
+        session.stage = "awaiting_date_selection";
+
+        return {
+          intent: "doctor_selection" as any,
+          stage: "awaiting_symptom_or_request",
+          nextStage: "awaiting_date_selection",
+          action: "list_dates",
+          data: {
+            doctorName: directDocMatch.name,
+            dates: availableDates.map(formatDateLabel),
+            rawDates: availableDates,
+          },
+        };
+      }
+
       if (doctors.length === 0) {
-        console.warn(`[ORCHESTRATOR] No doctors found for specialization="${specialization}" — check DB seeding`);
         session.stage = "awaiting_symptom_or_request";
         return {
           intent: intent as any,
@@ -164,9 +310,6 @@ async function routeByStage(
       session.selectedDoctorId = chosen.id;
       session.selectedDoctorName = chosen.name;
 
-      // This is the important cache-warming step: fetch (and cache) the
-      // FULL 7-day slot map right now, in one shot, so every subsequent
-      // date/time question in this conversation is a cache read.
       const week = await getDoctorWeekAvailability(chosen.id);
       const availableDates = Object.keys(week.slotsByDate).filter(
         (d) => week.slotsByDate[d].length > 0
@@ -226,8 +369,6 @@ async function routeByStage(
       const chosenDate = result.matchedIso;
       session.selectedDate = chosenDate;
 
-      // Pure cache read — slot map for this doctor was already cached when
-      // the doctor was selected. No DB round-trip here at all.
       const week = await getDoctorWeekAvailability(session.selectedDoctorId!);
       const slots = week.slotsByDate[chosenDate] ?? [];
       session.availableSlotsForDate = slots;
@@ -297,6 +438,7 @@ async function routeByStage(
       }
       session.patientName = validName;
       session.stage = "awaiting_patient_phone";
+      session.phonePurpose = "booking";
       return {
         intent: intent as any,
         stage: "awaiting_patient_name",
@@ -307,46 +449,45 @@ async function routeByStage(
     }
 
     case "awaiting_patient_phone": {
-      // Branch: this phone step is shared by booking, "check appointments",
-      // and "cancel appointment" flows — decide which by session flags.
       const phone = extractValidPhone(userText);
 
       if (!phone) {
-        // Never silently accept unparseable input here — this used to store
-        // things like "I have already given you my phone number" verbatim
-        // as the phone number and crash on insert (varchar(20) overflow).
         return {
           intent: intent as any,
           stage: session.stage,
           nextStage: session.stage,
           action: "ask_phone",
-          data: { retry: true },
+          data: { retry: true, purpose: session.phonePurpose },
         };
       }
-      session.patientPhone = phone;
 
-      if ((session as any)._phoneReasonIsLookup) {
-        (session as any)._phoneReasonIsLookup = false;
+      session.patientPhone = phone;
+      const purpose = session.phonePurpose ?? "booking";
+
+      // --- LOOKUP FLOW ---
+      if (purpose === "lookup") {
         const appts = await getUpcomingAppointmentsByPhone(phone);
+
         session.lastAppointments = appts.map((a) => ({
           appointmentId: a.appointmentId,
           doctorName: a.doctorName,
           date: formatDateLabel(a.slotDate as unknown as string),
           time: formatTimeLabel(a.startTime as unknown as string),
           status: a.status,
+          doctorId: a.doctorId!,
         }));
 
         if (session.lastAppointments.length === 0) {
-          session.stage = "done";
           return {
             intent: "check_appointments",
             stage: "awaiting_patient_phone",
-            nextStage: "done",
-            action: "no_appointments",
-            data: { phone },
+            nextStage: "awaiting_patient_phone",
+            action: "no_appointments_retry",
+            data: { phone, canRetry: true },
           };
         }
 
+        session.phonePurpose = undefined;
         session.stage = "done";
         return {
           intent: "check_appointments",
@@ -357,43 +498,108 @@ async function routeByStage(
         };
       }
 
-      if ((session as any)._phoneReasonIsCancel) {
-        (session as any)._phoneReasonIsCancel = false;
+      // --- RESCHEDULE FLOW ---
+      if (purpose === "reschedule") {
         const appts = await getUpcomingAppointmentsByPhone(phone);
+
+        console.log(`[RESCHEDULE] found ${appts.length} appointments for phone ${phone}`);
+
         session.lastAppointments = appts.map((a) => ({
           appointmentId: a.appointmentId,
           doctorName: a.doctorName,
           date: formatDateLabel(a.slotDate as unknown as string),
           time: formatTimeLabel(a.startTime as unknown as string),
           status: a.status,
+          doctorId: a.doctorId!,
         }));
 
         if (session.lastAppointments.length === 0) {
-          session.stage = "done";
+          // Stay on awaiting_patient_phone so they can retry — but clear purpose
+          // so a follow-up "reschedule" utterance can restart cleanly.
           return {
-            intent: "cancel_appointment",
+            intent: "reschedule_appointment",
             stage: "awaiting_patient_phone",
-            nextStage: "done",
-            action: "no_appointments",
-            data: { phone },
+            nextStage: "awaiting_patient_phone",
+            action: "no_appointments_retry",
+            data: { phone, canRetry: true, context: "reschedule" },
           };
         }
 
-        // Only one appointment on file — skip the "which one?" question
-        // entirely and go straight to confirming it. Asking the user to
-        // pick from a list of one is just friction, and (combined with the
-        // restart-loop bug) was the actual cause of the infinite phone-
-        // number loop reported.
         if (session.lastAppointments.length === 1) {
           const only = session.lastAppointments[0];
-          (session as any)._appointmentToCancel = only.appointmentId;
+          session.appointmentToCancelId = only.appointmentId;
+          session.rescheduleContext = {
+            doctorId: only.doctorId!,
+            doctorName: only.doctorName,
+            patientPhone: phone,
+          };
+          session.phonePurpose = undefined;  // ← IMPORTANT: clear so we don't re-ask phone
           session.stage = "cancelling_confirm";
+
+          console.log(`[RESCHEDULE] single appt found, moving to cancelling_confirm`);
+
+          return {
+            intent: "reschedule_appointment",
+            stage: "awaiting_patient_phone",
+            nextStage: "cancelling_confirm",
+            action: "confirm_reschedule",
+            data: {
+              doctorName: only.doctorName,
+              date: only.date,
+              time: only.time,
+            },
+          };
+        }
+        session.phonePurpose = undefined;  // ← clear
+        session.stage = "cancelling_select_appointment";
+        return {
+          intent: "reschedule_appointment",
+          stage: "awaiting_patient_phone",
+          nextStage: "cancelling_select_appointment",
+          action: "ask_which_to_reschedule",
+          data: { appointments: session.lastAppointments },
+        };
+      }
+
+
+      // --- CANCEL FLOW ---
+      if (purpose === "cancel") {
+        const appts = await getUpcomingAppointmentsByPhone(phone);
+
+        session.lastAppointments = appts.map((a) => ({
+          appointmentId: a.appointmentId,
+          doctorName: a.doctorName,
+          date: formatDateLabel(a.slotDate as unknown as string),
+          time: formatTimeLabel(a.startTime as unknown as string),
+          status: a.status,
+          doctorId: a.doctorId!,
+        }));
+
+        if (session.lastAppointments.length === 0) {
+          return {
+            intent: "cancel_appointment",
+            stage: "awaiting_patient_phone",
+            nextStage: "awaiting_patient_phone",
+            action: "no_appointments_retry",
+            data: { phone, canRetry: true },
+          };
+        }
+
+        if (session.lastAppointments.length === 1) {
+          const only = session.lastAppointments[0];
+          session.appointmentToCancelId = only.appointmentId;
+          session.stage = "cancelling_confirm";
+
           return {
             intent: "cancel_appointment",
             stage: "awaiting_patient_phone",
             nextStage: "cancelling_confirm",
             action: "confirm_cancellation",
-            data: { doctorName: only.doctorName, date: only.date, time: only.time },
+            data: {
+              doctorName: only.doctorName,
+              date: only.date,
+              time: only.time,
+            },
           };
         }
 
@@ -407,8 +613,10 @@ async function routeByStage(
         };
       }
 
-      // Default: this is the booking flow — move to final confirmation.
+      // --- BOOKING FLOW ---
+      session.phonePurpose = undefined;
       session.stage = "awaiting_confirmation";
+
       return {
         intent: "provide_phone",
         stage: "awaiting_patient_phone",
@@ -425,9 +633,6 @@ async function routeByStage(
 
     case "awaiting_confirmation": {
       if (intent === "confirm_no") {
-        // Try to understand what the user actually wants to change from
-        // the same utterance, instead of always assuming "time" (which
-        // previously ignored corrections like "no, I said July 5th").
         const dateResult = resolveDateSelection(userText, session.availableDates ?? []);
         if (dateResult.matchedIso) {
           session.selectedDate = dateResult.matchedIso;
@@ -442,19 +647,6 @@ async function routeByStage(
             data: {
               date: formatDateLabel(dateResult.matchedIso),
               times: session.availableSlotsForDate.map((s) => formatTimeLabel(s.startTime)),
-            },
-          };
-        }
-        if (dateResult.requestedIso) {
-          session.stage = "awaiting_date_selection";
-          return {
-            intent: intent as any,
-            stage: "awaiting_confirmation",
-            nextStage: "awaiting_date_selection",
-            action: "date_unavailable",
-            data: {
-              requestedDate: formatDateLabel(dateResult.requestedIso),
-              dates: (session.availableDates ?? []).map(formatDateLabel),
             },
           };
         }
@@ -477,8 +669,6 @@ async function routeByStage(
           };
         }
 
-        // Nothing specific detected in the correction — ask plainly rather
-        // than guessing which field ("date"/"time"/"doctor") to reopen.
         session.stage = "awaiting_change_target";
         return {
           intent: intent as any,
@@ -489,8 +679,6 @@ async function routeByStage(
         };
       }
 
-      // Any non-"no" answer here is treated as confirmation — deterministic
-      // YES_RE already filtered for affirmative language upstream.
       const result = await bookSlot({
         slotId: session.selectedSlotId!,
         doctorId: session.selectedDoctorId!,
@@ -500,9 +688,6 @@ async function routeByStage(
       });
 
       if (!result.ok) {
-        // Slot was taken between offer and confirmation — re-pull fresh
-        // availability (cache already invalidated by the failed attempt's
-        // race) so the next turn offers only truly-open times.
         session.stage = "awaiting_time_selection";
         const week = await getDoctorWeekAvailability(session.selectedDoctorId!);
         session.availableSlotsForDate = week.slotsByDate[session.selectedDate!] ?? [];
@@ -580,6 +765,7 @@ async function routeByStage(
     }
 
     case "cancelling_select_appointment": {
+      // Reuse existing selection logic but set rescheduleContext instead of just cancelId
       const idxMatch = userText.match(/\b(\d)\b/);
       const ordinalMap: Record<string, number> = { first: 0, second: 1, third: 2 };
       let idx: number | null = idxMatch ? parseInt(idxMatch[1], 10) - 1 : null;
@@ -590,7 +776,6 @@ async function routeByStage(
       }
       let chosen = idx !== null ? session.lastAppointments?.[idx] : null;
 
-      // Also allow "cancel the one with Dr. Kapoor" style references.
       if (!chosen) {
         const lower = userText.toLowerCase();
         chosen = session.lastAppointments?.find((a) =>
@@ -599,16 +784,40 @@ async function routeByStage(
       }
 
       if (!chosen) {
+        const isReschedule = session.rescheduleContext !== undefined ||
+          intent === "reschedule_appointment";
+
         return {
+
           intent: intent as any,
           stage: session.stage,
           nextStage: session.stage,
-          action: "ask_which_to_cancel",
+          action: isReschedule ? "ask_which_to_reschedule" : "ask_which_to_cancel",
           data: { appointments: session.lastAppointments ?? [] },
         };
       }
 
-      (session as any)._appointmentToCancel = chosen.appointmentId;
+      session.appointmentToCancelId = chosen.appointmentId;
+
+      // If we're in reschedule flow, store context
+      if (intent === "reschedule_appointment" || session.rescheduleContext) {
+        session.rescheduleContext = {
+          doctorId: chosen.doctorId!,
+          doctorName: chosen.doctorName,
+          patientPhone: session.patientPhone!,
+        };
+        session.stage = "cancelling_confirm";
+        return {
+          intent: "reschedule_appointment",
+          stage: "cancelling_select_appointment",
+          nextStage: "cancelling_confirm",
+          action: "confirm_reschedule",
+          data: { doctorName: chosen.doctorName, date: chosen.date, time: chosen.time },
+        };
+      }
+
+
+      // Otherwise normal cancel
       session.stage = "cancelling_confirm";
       return {
         intent: intent as any,
@@ -618,9 +827,9 @@ async function routeByStage(
         data: { doctorName: chosen.doctorName, date: chosen.date, time: chosen.time },
       };
     }
-
     case "cancelling_confirm": {
-      if (intent === "confirm_no") {
+      // FIX #2: Properly handle "no" / "don't cancel"
+      if (intent === "confirm_no" || intent === "unknown") {  // Treat unknown as no in this sensitive stage
         session.stage = "done";
         return {
           intent: intent as any,
@@ -630,10 +839,44 @@ async function routeByStage(
           data: {},
         };
       }
-      const apptId = (session as any)._appointmentToCancel as number;
+
+      // If we get here, user confirmed yes (or we fell through)
+      const apptId = session.appointmentToCancelId!;
       await cancelAppointment(apptId);
-      // Offer to book a new slot right away — this is what makes "reschedule"
-      // actually work end-to-end, since it's handled as cancel-then-rebook.
+
+      // FIX #1: If this was a reschedule request, immediately start rebooking
+      if (session.rescheduleContext) {
+        const ctx = session.rescheduleContext;
+        // Pre-populate session for booking
+        session.selectedDoctorId = ctx.doctorId;
+        session.selectedDoctorName = ctx.doctorName;
+        session.patientPhone = ctx.patientPhone;
+        session.patientName = session.patientName || "the patient";  // Use previous if available
+
+        // Fetch availability for this doctor
+        const week = await getDoctorWeekAvailability(ctx.doctorId);
+        const availableDates = Object.keys(week.slotsByDate).filter(
+          (d) => week.slotsByDate[d].length > 0
+        );
+        session.availableDates = availableDates;
+        session.rescheduleContext = undefined;  // Clear context
+        session.appointmentToCancelId = undefined;
+
+        session.stage = "awaiting_date_selection";
+        return {
+          intent: "reschedule_appointment",
+          stage: "cancelling_confirm",
+          nextStage: "awaiting_date_selection",
+          action: "reschedule_select_date",  // LLM says "Cancelled. When would you like the new appointment?"
+          data: {
+            doctorName: ctx.doctorName,
+            dates: availableDates.map(formatDateLabel),
+            rawDates: availableDates,
+          },
+        };
+      }
+
+      // Normal cancellation
       session.stage = "awaiting_symptom_or_request";
       return {
         intent: intent as any,
@@ -645,13 +888,6 @@ async function routeByStage(
     }
 
     default: {
-      // Reached from "done"/"booked"/etc. when the user starts a new
-      // request. Previously this only returned nextStage in the response
-      // data without actually updating session.stage, so every follow-up
-      // after finishing a booking/cancellation/lookup just repeated "what
-      // symptoms are you having?" forever instead of ever processing the
-      // answer. Now we hand the same message straight to the symptom stage
-      // instead of wasting a turn just to re-ask for it.
       session.stage = "awaiting_symptom_or_request";
       return routeByStage(session, intent, userText);
     }
