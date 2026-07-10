@@ -108,23 +108,17 @@ export function containsMonthMention(text: string): boolean {
   return MONTH_MENTION_RE.test(text);
 }
 export function extractDoctorNameQuery(text: string): string | null {
-  const t = text.trim();
-
-  const directDoctorMatch = t.match(
-    /\b(?:dr\.?|doctor)\s+([a-z][a-z .'-]{1,80})/i
+  // Match "Dr." / "Dr" / "Doctor" followed by one or two name words
+  const match = text.match(
+    /\b(?:dr\.?|doctor)\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})/i
   );
+  if (match) return match[1].trim();
 
-  if (directDoctorMatch) {
-    return cleanDoctorNameQuery(directDoctorMatch[1]);
-  }
-
-  const withDoctorMatch = t.match(
-    /\b(?:with|see|visit|book(?: an)? appointment with)\s+(?:dr\.?|doctor)?\s*([a-z][a-z .'-]{1,80})/i
+  // Match "appointment with <Name>" / "book with <Name>"
+  const withMatch = text.match(
+    /\b(?:with|see|visit|consult)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})/
   );
-
-  if (withDoctorMatch) {
-    return cleanDoctorNameQuery(withDoctorMatch[1]);
-  }
+  if (withMatch) return withMatch[1].trim();
 
   return null;
 }
@@ -164,7 +158,11 @@ export function parseCalendarDateMention(text: string, reference: Date = new Dat
   if (candidate < refYearStart) {
     candidate = new Date(reference.getFullYear() + 1, monthIdx, day);
   }
-  return candidate.toISOString().slice(0, 10);
+  const y = candidate.getFullYear();
+  const m = String(candidate.getMonth() + 1).padStart(2, "0");
+  const d = String(candidate.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+
 }
 
 // ---------------------------------------------------------------------------

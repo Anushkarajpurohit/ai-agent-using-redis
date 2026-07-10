@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, gte, ilike } from "drizzle-orm";
 import { db } from "../client";
 import { doctors } from "../schema";
 import { cacheGet, cacheSet, CacheKeys } from "../../lib/cache";
@@ -35,6 +35,51 @@ export async function getDoctorsBySpecialization(
     .orderBy(doctors.rating);
 
   await cacheSet(key, rows, TTL_DOCTORS);
+  return rows;
+}
+
+
+export async function searchDoctorByName(
+  nameQuery: string
+): Promise<{
+  id: number;
+  name: string;
+  specialization: string;
+  qualifications: string | null;
+  yearsExperience: number | null;
+  clinicName: string | null;
+  city: string | null;
+  rating: number | null;
+}[]> {
+  const cleaned = nameQuery
+    .replace(/\b(dr|doctor)\.?\b/gi, "")
+    .trim();
+
+  const words = cleaned
+    .split(/\s+/)
+    .filter((w) => w.length > 1);
+
+  if (words.length === 0) return [];
+
+  const nameConditions = words.map((w) =>
+    ilike(doctors.name, `%${w}%`)
+  );
+
+  const rows = await db
+    .select({
+      id: doctors.id,
+      name: doctors.name,
+      specialization: doctors.specialization,
+      qualifications: doctors.qualifications,
+      yearsExperience: doctors.yearsExperience,
+      clinicName: doctors.clinicName,
+      city: doctors.city,
+      rating: doctors.rating,
+    })
+    .from(doctors)
+    .where(and(eq(doctors.active, true), ...nameConditions))
+    .limit(5);
+
   return rows;
 }
 

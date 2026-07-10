@@ -59,7 +59,19 @@ export function classifyIntent(userText: string, stage: ConversationStage): Inte
         return "date_selection";
       }
       break;
-
+    case "awaiting_time_preference":
+      // User picked a period
+      if (/\b(morning|forenoon|early|before\s+(noon|lunch))\b/i.test(text))
+        return "time_preference";
+      if (/\b(afternoon|noon|midday|lunch|post[- ]?lunch|after\s+lunch)\b/i.test(text))
+        return "time_preference";
+      if (/\b(evening|night|late|after\s+(5|five))\b/i.test(text))
+        return "time_preference";
+      // User skipped preference and said a specific time like "10 AM"
+      if (TIME_RE.test(text.replace(/\./g, ""))) return "time_selection";
+      if (ORDINAL_RE.test(text) && !containsMonthMention(text))
+        return "time_selection";
+      break;
     case "awaiting_time_selection":
     case "showing_slots":
       if (TIME_RE.test(text.replace(/\./g, ""))) {

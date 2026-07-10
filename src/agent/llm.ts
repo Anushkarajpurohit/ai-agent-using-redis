@@ -42,6 +42,54 @@ function templateFallback(facts: TurnFacts): string {
       const names = (d.doctors as any[]).map((doc, i) => `${i + 1}. ${doc.name}`).join(", ");
       return `For ${d.specialization}, I found: ${names}. Who would you like to book with?`;
     }
+    case "ask_time_preference": {
+      const parts: string[] = [];
+      if (d.morningCount > 0)
+        parts.push(
+          `morning (${d.morningCount} slot${d.morningCount > 1 ? "s" : ""})`
+        );
+      if (d.afternoonCount > 0)
+        parts.push(
+          `afternoon (${d.afternoonCount} slot${d.afternoonCount > 1 ? "s" : ""})`
+        );
+      if (d.eveningCount > 0)
+        parts.push(
+          `evening (${d.eveningCount} slot${d.eveningCount > 1 ? "s" : ""})`
+        );
+      return d?.retry
+        ? `I didn't catch that. We have ${parts.join(", ")} on ${d.date}. Would you prefer morning, afternoon, or evening?`
+        : `For ${d.date}, we have ${parts.join(", ")}. Would you prefer morning, afternoon, or evening?`;
+    }
+    // In your action switch statement, add:
+
+    case "ask_symptom": {
+      if (facts.data.resumeAvailable) {
+        return "Ask if they want to continue their previous booking or start a new one.";
+      } else {
+        return "Greet warmly and ask what brings them in today or which doctor they'd like to see.";
+      }
+    }
+    case "clarify_unknown": {
+      if (d.reason === "doctor_not_found") {
+        return `I couldn't find a Dr. ${d.doctorName} in our system. Could you double-check the name, or tell me your symptoms so I can find the right doctor for you?`;
+      }
+      if (d.reason === "no_availability") {
+        return `Dr. ${d.doctorName} doesn't have any open slots this week. Would you like to try another doctor?`;
+      }
+      if (d.reason === "no_doctors_for_specialization") {
+        return d.confident
+          ? `I don't see any doctors available for ${d.specialization} right now. Would you like to try a different concern, or see a general physician instead?`
+          : "Could you tell me a bit more about your symptoms — like skin issues, chest pain, or joint pain — so I can find the right doctor for you?";
+      }
+      return "Sorry, I didn't quite catch that — could you rephrase?";
+    }
+    case "list_slots":
+      if (d.period) {
+        return `Here are the ${d.period} slots on ${d.date}: ${(d.times as string[]).join(", ")}. Which time works for you?`;
+      }
+      return `On ${d.date}, available times are: ${(d.times as string[]).join(", ")}. Which time suits you?`;
+    case "no_slots_in_period":
+      return `Sorry, there are no ${d.period} slots on ${d.date}. We have openings in the ${(d.periods as string[]).join(" and ")}. Which would you prefer?`;
     case "ask_doctor_choice":
       return "Which doctor would you like to book with?";
     case "list_dates":
@@ -57,9 +105,22 @@ function templateFallback(facts: TurnFacts): string {
         ? "Sorry, I didn't catch a valid name there — could you tell me your full name?"
         : "Great. Can I have your full name for the booking?";
     case "ask_phone":
-      return d?.retry
-        ? "That doesn't look like a valid phone number — could you say it again, digits only?"
-        : "Thanks. And what's the best phone number to reach you?";
+      if (d?.retry) {
+        if (d?.purpose === "reschedule")
+          return "I need your phone number to look up your appointments. Could you say your 10-digit number again?";
+        if (d?.purpose === "cancel")
+          return "I need your phone number to find the appointment. Could you say your 10-digit number?";
+        return "That doesn't look like a valid phone number — could you say it again, digits only?";
+      }
+      if (d?.purpose === "reschedule")
+        return "Sure, I can help you reschedule. What's the phone number the appointment was booked under?";
+      if (d?.purpose === "cancel")
+        return "I can help you cancel that. What's the phone number the appointment was booked under?";
+      if (d?.purpose === "lookup")
+        return "I'll look that up for you. What phone number are your appointments under?";
+      if (d?.purpose === "booking")
+        return "Could I have your phone number? If you've been here before, I'll pull up your details automatically.";
+      return "Could I have your phone number please?";
     case "date_unavailable":
       return `Sorry, ${d.requestedDate} isn't available. Open dates are: ${d.dates.join(", ")}. Which of these works for you?`;
     case "time_unavailable":
@@ -136,6 +197,9 @@ const DETERMINISTIC_ONLY_ACTIONS = new Set<TurnFacts["action"]>([
   "reschedule_select_date",
   "ask_which_to_reschedule",
   "ask_which_to_cancel",
+  "list_slots",                // ← ADD (prevents LLM truncating 10 slots to 2)
+  "ask_time_preference",       // ← ADD
+  "no_slots_in_period",
 ]);
 
 // Extra safety net for the remaining (lower-stakes, more conversational)

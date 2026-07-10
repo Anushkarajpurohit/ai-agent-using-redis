@@ -12,6 +12,7 @@ export type ConversationStage =
   | "awaiting_confirmation"
   | "awaiting_change_target"
   | "booked"
+  | "awaiting_time_preference"
   | "checking_appointments"
   | "cancelling_select_appointment"
   | "cancelling_confirm"
@@ -27,6 +28,7 @@ export type Intent =
   | "time_selection"
   | "confirm_yes"
   | "confirm_no"
+  | "time_preference"
   | "check_appointments"
   | "cancel_appointment"
   | "provide_name"
@@ -66,14 +68,23 @@ export interface ConversationSession {
   createdAt: string;
   updatedAt: string;
 
+  contextStack?: Array<{
+    stage: ConversationStage;
+    data: Partial<ConversationSession>;
+  }>;
+  previousContext?: Partial<ConversationSession>;
   phonePurpose?: "booking" | "lookup" | "cancel" | "reschedule";
   rescheduleContext?: {
     doctorId: number;
     doctorName: string;
     patientPhone: string;
   };
-  appointmentToCancelId?: number;
 
+  sessionPhone?: string;
+  sessionPatientId?: number;
+  sessionPatientName?: string;
+  appointmentToCancelId?: number;
+  existingPatientId?: number;
   // accumulated deterministic state — the "form" being filled in
   symptomText?: string;
   specialization?: string;
@@ -82,11 +93,13 @@ export interface ConversationSession {
   selectedDoctorName?: string;
   availableDates?: string[]; // derived from cached slot map
   selectedDate?: string;
+  allSlotsForDate?: SlotRecord[];          // ← NEW: unfiltered full list
   availableSlotsForDate?: SlotRecord[];
   selectedSlotId?: number;
   selectedSlotTime?: string;
   patientName?: string;
   patientPhone?: string;
+
   reasonForVisit?: string;
   lastAppointments?: Array<{
     appointmentId: number;
@@ -129,7 +142,9 @@ export interface TurnFacts {
   | "booking_failed"
   | "list_appointments"
   | "no_appointments"
-  | "no_appointments_retry"      // ADD
+  | "no_appointments_retry"
+  | "ask_time_preference"         // ← NEW
+  | "no_slots_in_period"       // ADD
   | "ask_which_to_reschedule"    // ADD
 
   | "ask_which_to_cancel"

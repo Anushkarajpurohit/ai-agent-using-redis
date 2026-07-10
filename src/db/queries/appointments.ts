@@ -6,7 +6,23 @@ import { invalidateDoctorWeekCache } from "./slots";
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
+export async function getPatientByPhone(
+  phone: string
+): Promise<{ id: number; name: string; phone: string } | null> {
+  const normalized = phone.replace(/\D/g, "");
 
+  const results = await db
+    .select({
+      id: patients.id,
+      name: patients.name,
+      phone: patients.phone,
+    })
+    .from(patients)
+    .where(eq(patients.phone, normalized))
+    .limit(1);
+
+  return results[0] ?? null;
+}
 /**
  * Book a slot atomically. Cache is NEVER trusted for the write path — we
  * re-check `isBooked` straight from Postgres inside a transaction with a
@@ -19,6 +35,7 @@ export async function bookSlot(params: {
   doctorId: number;
   patientName: string;
   patientPhone: string;
+  patientId?: number;
   reasonForVisit?: string;
 }): Promise<
   | { ok: true; appointmentId: number }
