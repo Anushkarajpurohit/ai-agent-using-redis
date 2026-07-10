@@ -19,7 +19,28 @@ export type ConversationStage =
   | "rescheduling_lookup"
   | "done";
 
+export type ConversationGoal =
+  | "none"
+  | "booking"
+  | "cancellation"
+  | "reschedule"
+  | "lookup";
+
+export interface CollectedSlots {
+  symptomText?: string;
+  specialization?: string;
+  doctorId?: number;
+  doctorName?: string;
+  date?: string;
+  slotId?: number;
+  slotTime?: string;
+  patientName?: string;
+  patientPhone?: string;
+  patientId?: number;
+}
+
 export type Intent =
+  | "new_booking_request"
   | "greeting"
   | "symptom_or_specialization_query"
   | "reschedule_appointment"
@@ -64,6 +85,7 @@ export interface DoctorSlotsByDate {
 
 export interface ConversationSession {
   sessionId: string;
+  goal: ConversationGoal;
   stage: ConversationStage;
   createdAt: string;
   updatedAt: string;
@@ -154,6 +176,7 @@ export interface TurnFacts {
 
   | "cancellation_success"
   | "clarify_unknown"
+  | "workflow_switched"
   | "goodbye";
   data: Record<string, unknown>;
 }

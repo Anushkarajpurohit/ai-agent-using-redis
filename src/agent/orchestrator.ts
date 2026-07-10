@@ -19,7 +19,7 @@ import {
   getUpcomingAppointmentsByPhone,
   getPatientByPhone
 } from "../db/queries/appointments";
-import { ConversationSession, TurnFacts, Intent, SlotRecord, ConversationStage } from "./types";
+import { ConversationSession, TurnFacts, Intent, SlotRecord, ConversationStage, ConversationGoal } from "./types";
 import { StringDecoder } from "string_decoder";
 export interface OrchestratorResult {
   reply: string;
@@ -89,11 +89,12 @@ function formatTimeLabel(hhmmss: string): string {
   const hour12 = h % 12 === 0 ? 12 : h % 12;
   return `${hour12}:${String(m).padStart(2, "0")} ${period}`;
 }
-function forceGlobalIntent(
+function resolveIntentAndWorkflow(
   text: string,
   stage: ConversationSession["stage"],
-  classified: Intent
-): Intent {
+  classified: Intent,
+  session: ConversationSession
+): { intent: Intent; workflowAction: "continue" | "switch"; newGoal?: ConversationGoal } {
   const t = text.toLowerCase();
 
   const mentionsAppointment = /\bappointments?\b/.test(t);
@@ -101,35 +102,30 @@ function forceGlobalIntent(
   const wantsCancel = mentionsAppointment && /\b(cancel|delete|remove)\b/.test(t);
   const wantsReschedule = /\breschedul(e|ing)\b/i.test(t);
 
-  // CRITICAL FIX: Do not restart reschedule flow if we are already inside it.
-  // Stages that belong to an in-progress reschedule/cancel/booking flow should
-  // be preserved — otherwise the user gets stuck in a loop being asked for
-  // their phone number again and again.
-  const inActiveFlow =
-    stage === "awaiting_patient_phone" ||
-    stage === "awaiting_date_selection" ||
-    stage === "awaiting_time_selection" ||
-    stage === "awaiting_patient_name" ||
-    stage === "awaiting_confirmation" ||
-    stage === "cancelling_select_appointment" ||
-    stage === "cancelling_confirm";
-
-  if (wantsReschedule && stage === "awaiting_patient_phone") {
-    return classified; // let the normal stage handler deal with it
-  }
-  if (wantsReschedule && !inActiveFlow) return "reschedule_appointment";
-  if (wantsCancel && !inActiveFlow) return "cancel_appointment";
-  if (wantsLookup && !inActiveFlow) return "check_appointments";
-
-  if (stage !== "cancelling_confirm" && wantsCancel && !inActiveFlow) {
-    if (/\b(don'?t|do not|never|abort|stop)\b/i.test(t) && /\bcancel\b/i.test(t)) {
-      return "confirm_no";
+  // If the user explicitly asks for a workflow switch:
+  if (wantsReschedule && session.goal !== "reschedule") return { intent: "reschedule_appointment", workflowAction: "switch", newGoal: "reschedule" };
+  
+  if (wantsCancel && session.goal !== "cancellation") {
+    if (!(stage === "cancelling_confirm" && /\b(don'?t|do not|never|abort|stop)\b/i.test(t))) {
+      return { intent: "cancel_appointment", workflowAction: "switch", newGoal: "cancellation" };
     }
-    if (/\b(yes|yeah|sure|ok|okay|confirm)\b/i.test(t)) return "confirm_yes";
-    if (/\b(no|nope)\b/i.test(t)) return "confirm_no";
   }
 
-  return classified;
+  if (wantsLookup && session.goal !== "lookup") return { intent: "check_appointments", workflowAction: "switch", newGoal: "lookup" };
+
+  if (classified === "new_booking_request" && session.goal !== "booking") {
+    return { intent: "new_booking_request", workflowAction: "switch", newGoal: "booking" };
+  }
+
+  if (stage !== "cancelling_confirm" && wantsCancel) {
+    if (/\b(don'?t|do not|never|abort|stop)\b/i.test(t) && /\bcancel\b/i.test(t)) {
+      return { intent: "confirm_no", workflowAction: "continue" };
+    }
+    if (/\b(yes|yeah|sure|ok|okay|confirm)\b/i.test(t)) return { intent: "confirm_yes", workflowAction: "continue" };
+    if (/\b(no|nope)\b/i.test(t)) return { intent: "confirm_no", workflowAction: "continue" };
+  }
+
+  return { intent: classified, workflowAction: "continue" };
 }
 
 function clearBookingDraft(session: ConversationSession) {
@@ -166,6 +162,8 @@ function saveCurrentContext(session: ConversationSession) {
     selectedSlotTime: session.selectedSlotTime,
     patientName: session.patientName,
     patientPhone: session.patientPhone,
+    existingPatientId: session.existingPatientId, // Preserved
+
     reasonForVisit: session.reasonForVisit,
   };
 }
@@ -184,105 +182,102 @@ export async function handleTurn(
   const session = await loadSession(sessionId);
 
   const rawIntent = classifyIntent(userText, session.stage);
-  const intent = forceGlobalIntent(userText, session.stage, rawIntent);
+  const { intent, workflowAction, newGoal } = resolveIntentAndWorkflow(userText, session.stage, rawIntent, session);
 
   console.log(
-    `[ORCHESTRATOR] session=${sessionId} stage=${session.stage} rawIntent=${rawIntent} intent=${intent} text="${userText}"`
+    `[ORCHESTRATOR] session=${sessionId} stage=${session.stage} rawIntent=${rawIntent} intent=${intent} workflowAction=${workflowAction} text="${userText}"`
   );
 
-  let facts: TurnFacts;
-  const inActiveFlow =
-    session.stage === "awaiting_patient_phone" ||
-    session.stage === "awaiting_date_selection" ||
-    session.stage === "awaiting_time_selection" ||
-    session.stage === "awaiting_patient_name" ||
-    session.stage === "awaiting_confirmation" ||
-    session.stage === "cancelling_select_appointment" ||
-    session.stage === "cancelling_confirm";
-  const inCancellationFlow =
-    session.stage === "cancelling_select_appointment" ||
-    session.stage === "cancelling_confirm";
+  let facts: TurnFacts | undefined;
 
-  if (intent === "goodbye") {
-    session.stage = "done";
+  // Handle workflow switches centrally
+  if (workflowAction === "switch" && newGoal) {
+    saveCurrentContext(session);
 
-    facts = {
-      intent,
-      stage: session.stage,
-      nextStage: "done",
-      action: "goodbye",
-      data: {},
+    // Carry over slots
+    const preserved = {
+      patientName: session.patientName,
+      patientPhone: session.patientPhone,
+      existingPatientId: session.existingPatientId,
     };
-  } else if (intent === "check_appointments") {
     clearBookingDraft(session);
+    session.patientName = preserved.patientName;
+    session.patientPhone = preserved.patientPhone;
+    session.existingPatientId = preserved.existingPatientId;
 
-    session.stage = "awaiting_patient_phone";
-    session.phonePurpose = "lookup";
+    session.goal = newGoal;
 
-    delete (session as any)._phoneReasonIsLookup;
-    delete (session as any)._phoneReasonIsCancel;
+    if (newGoal === "booking") {
+      session.stage = "awaiting_symptom_or_request";
+      // Don't generate facts yet, let routeByStage handle the new_booking_request
+    } else if (newGoal === "lookup") {
+      session.stage = "awaiting_patient_phone";
+      session.phonePurpose = "lookup";
+      if (!session.patientPhone) {
+        facts = {
+          intent,
+          stage: "checking_appointments",
+          nextStage: "awaiting_patient_phone",
+          action: "ask_phone",
+          data: { purpose: "lookup" },
+        };
+      }
+    } else if (newGoal === "reschedule") {
+      session.stage = "awaiting_patient_phone";
+      session.phonePurpose = "reschedule";
+      if (!session.patientPhone) {
+        facts = {
+          intent,
+          stage: "rescheduling_lookup",
+          nextStage: "awaiting_patient_phone",
+          action: "ask_phone",
+          data: { purpose: "reschedule" },
+        };
+      }
+    } else if (newGoal === "cancellation") {
+      session.stage = "awaiting_patient_phone";
+      session.phonePurpose = "cancel";
+      if (!session.patientPhone) {
+        facts = {
+          intent,
+          stage: "cancelling_select_appointment",
+          nextStage: "awaiting_patient_phone",
+          action: "ask_phone",
+          data: { purpose: "cancel" },
+        };
+      }
+    }
+  }
 
-    facts = {
-      intent,
-      stage: "checking_appointments",
-      nextStage: "awaiting_patient_phone",
-      action: "ask_phone",
-      data: { purpose: "lookup" },
-    };
-  } else if (intent === "reschedule_appointment" && !inActiveFlow) {
-    clearBookingDraft(session);
-    session.stage = "awaiting_patient_phone";
-    session.phonePurpose = "reschedule";
+  // If a workflow switch occurred but we already have the phone (e.g. from previous flow), 
+  // we let routeByStage process it normally, but first acknowledge the switch.
+  if (workflowAction === "switch" && !facts && newGoal !== "booking") {
+      // Actually, if we switch and have the phone, we should just process the intent through routeByStage.
+      // E.g. routeByStage will handle "awaiting_patient_phone" with intent="cancel_appointment" or "provide_phone"
+      // Wait, if intent is "cancel_appointment" and we are in "awaiting_patient_phone", routeByStage might need to know.
+      // Let's just let routeByStage handle the current state.
+  }
 
-    facts = {
-      intent,
-      stage: "rescheduling_lookup",
-      nextStage: "awaiting_patient_phone",
-      action: "ask_phone",
-      data: { purpose: "reschedule" },
-    };
-
-    // } else if (intent === "reschedule_appointment" && !inCancellationFlow) {
-
-    //   clearBookingDraft(session);
-    //   session.stage = "awaiting_patient_phone";
-    //   session.phonePurpose = "reschedule";  // NEW distinct purpose
-
-    //   facts = {
-    //     intent,
-    //     stage: "rescheduling_lookup",
-    //     nextStage: "awaiting_patient_phone",
-    //     action: "ask_phone",
-    //     data: { purpose: "reschedule" },
-    //   };
-  } else if (intent === "cancel_appointment" && !inActiveFlow) {
-    clearBookingDraft(session);
-
-    session.stage = "awaiting_patient_phone";
-    session.phonePurpose = "cancel";
-
-    delete (session as any)._phoneReasonIsLookup;
-    delete (session as any)._phoneReasonIsCancel;
-
-    facts = {
-      intent,
-      stage: "cancelling_select_appointment",
-      nextStage: "awaiting_patient_phone",
-      action: "ask_phone",
-      data: { purpose: "cancel" },
-    };
-  } else if (intent === "greeting" && !resolveSpecialization(userText).confident) {
-    session.stage = "awaiting_symptom_or_request";
-
-    facts = {
-      intent,
-      stage: "greeting",
-      nextStage: "awaiting_symptom_or_request",
-      action: "ask_symptom",
-      data: {},
-    };
-  } else {
-    facts = await routeByStage(session, intent, userText);
+  if (!facts) {
+    if (intent === "goodbye") {
+      session.stage = "done";
+      facts = {
+        intent,
+        stage: session.stage,
+        nextStage: "done",
+        action: "goodbye",
+        data: {},
+      };
+    } else {
+      facts = await routeByStage(session, intent, userText);
+      
+      // If we switched workflow and generated normal facts, wrap it with an acknowledgment
+      if (workflowAction === "switch") {
+        // Option 1: Just use facts as generated
+        // Option 2: Prepend an acknowledgment in the LLM. 
+        // For simplicity, we just proceed. The new flow is clear enough.
+      }
+    }
   }
 
   await saveSession(session);
@@ -313,17 +308,61 @@ async function routeByStage(
   intent: string,
   userText: string
 ): Promise<TurnFacts> {
+  const switchCheck = detectContextSwitch(userText, session.stage, intent, session);
 
-  // ═══════════════════════════════════════════════════════════════
-  // CONTEXT SWITCH DETECTION - Runs before any stage logic
-  // ═══════════════════════════════════════════════════════════════
+  if (switchCheck.shouldSwitch && switchCheck.targetStage) {
+    console.log(`[CONTEXT SWITCH] ${switchCheck.reason}: ${session.stage} → ${switchCheck.targetStage}`);
 
-  const isContextSwitch = detectContextSwitch(userText, session.stage, intent);
-
-  if (isContextSwitch) {
-    console.log(`[CONTEXT SWITCH] Detected switch from ${session.stage} to new context`);
+    // Save current context for potential "go back" later
     saveCurrentContext(session);
+
+    // Clear only the fields that are being changed, preserve patient info
+    if (switchCheck.targetStage === "awaiting_doctor_selection") {
+      // Keep patient info, clear doctor/date/time
+      delete session.selectedDoctorId;
+      delete session.selectedDoctorName;
+      delete session.selectedDate;
+      delete session.selectedSlotId;
+      delete session.selectedSlotTime;
+      delete session.availableDates;
+      delete session.availableSlotsForDate;
+      delete session.allSlotsForDate;
+      // Keep: patientName, patientPhone, existingPatientId, symptomText, specialization
+    }
+    else if (switchCheck.targetStage === "awaiting_date_selection") {
+      // Keep doctor, clear date/time
+      delete session.selectedDate;
+      delete session.selectedSlotId;
+      delete session.selectedSlotTime;
+      delete session.availableSlotsForDate;
+      delete session.allSlotsForDate;
+      // Keep: selectedDoctorId, selectedDoctorName, patient info
+    }
+    else if (switchCheck.targetStage === "awaiting_time_selection" || switchCheck.targetStage === "awaiting_time_preference") {
+      // Keep doctor and date, clear time
+      delete session.selectedSlotId;
+      delete session.selectedSlotTime;
+      // Keep: selectedDoctorId, selectedDate, patient info
+    }
+    else if (switchCheck.targetStage === "awaiting_symptom_or_request") {
+      // Full reset except patient info if already known
+      const preservedPatientInfo = {
+        patientName: session.patientName,
+        patientPhone: session.patientPhone,
+        existingPatientId: session.existingPatientId,
+      };
+      clearBookingDraft(session);
+      session.patientName = preservedPatientInfo.patientName;
+      session.patientPhone = preservedPatientInfo.patientPhone;
+      session.existingPatientId = preservedPatientInfo.existingPatientId;
+    }
+
+    session.stage = switchCheck.targetStage;
+
+    // Route to the new stage immediately
+    return routeByStage(session, intent, userText);
   }
+
 
   switch (session.stage) {
     case "greeting":
@@ -449,6 +488,16 @@ async function routeByStage(
       const { specialization, matchedKeyword, confident } =
         resolveSpecialization(userText);
 
+      if (!confident) {
+        session.stage = "awaiting_symptom_or_request";
+        return {
+          intent: 'symptom_or_specialization_query' as any,
+          stage: "awaiting_symptom_or_request",
+          nextStage: "awaiting_symptom_or_request",
+          action: "clarify_unknown",
+          data: { reason: "specialization_not_matched", symptomText: userText },
+        };
+      }
       session.symptomText = userText;
       session.specialization = specialization;
 
@@ -926,6 +975,7 @@ async function routeByStage(
     }
 
     case "awaiting_time_selection": {
+
       // ═══ HANDLE DATE CHANGES DURING TIME SELECTION ═══
       const dateSwitch = resolveDateSelection(userText, session.availableDates ?? []);
       if (dateSwitch.matchedIso && dateSwitch.matchedIso !== session.selectedDate) {
@@ -935,7 +985,8 @@ async function routeByStage(
         const slots = week.slotsByDate[dateSwitch.matchedIso] ?? [];
         session.allSlotsForDate = slots;
         session.availableSlotsForDate = slots;
-
+        delete session.selectedSlotId;
+        delete session.selectedSlotTime;
         const periods = categorizeSlotsByPeriod(slots);
         if (periods.availablePeriods.length >= 2 && slots.length > 5) {
           session.stage = "awaiting_time_preference";
@@ -1244,20 +1295,16 @@ async function routeByStage(
           },
         };
       }
+      // ── New patient: we need their name ──
       session.phonePurpose = undefined;
-      session.stage = "awaiting_confirmation";
+      session.stage = "awaiting_patient_name";
 
       return {
         intent: "provide_phone",
         stage: "awaiting_patient_phone",
-        nextStage: "awaiting_confirmation",
-        action: "confirm_booking_details",
-        data: {
-          doctorName: session.selectedDoctorName,
-          date: session.selectedDate ? formatDateLabel(session.selectedDate) : undefined,
-          time: session.selectedSlotTime,
-          patientName: session.patientName,
-        },
+        nextStage: "awaiting_patient_name",
+        action: "ask_name",
+        data: {},
       };
     }
 
@@ -1564,31 +1611,79 @@ async function routeByStage(
 function detectContextSwitch(
   userText: string,
   currentStage: ConversationStage,
-  intent: string
-): boolean {
-  // Don't treat these as switches - they're part of normal flow
-  if (intent === "confirm_yes" || intent === "confirm_no") return false;
-
+  intent: string,
+  session: ConversationSession
+): { shouldSwitch: boolean; targetStage: ConversationStage | null; reason: string } {
   const lower = userText.toLowerCase();
 
-  // Detect if user is asking about a different aspect mid-flow
-  const mentionsDoctor = /\b(doctor|dr\.?)\s+\w+/i.test(userText);
-  const mentionsDate = containsMonthMention(userText) || /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(lower);
-  const mentionsTime = /\b\d{1,2}(:\d{2})?\s?(am|pm)\b/i.test(lower);
+  // Explicit change commands
+  if (/\b(change|switch|different|another|go back|back to|not this|wrong)\b/i.test(lower)) {
+    if (/\bdoctor\b/i.test(lower)) return { shouldSwitch: true, targetStage: "awaiting_doctor_selection", reason: "user_wants_different_doctor" };
+    if (/\bdate\b/i.test(lower) || /\bday\b/i.test(lower)) return { shouldSwitch: true, targetStage: "awaiting_date_selection", reason: "user_wants_different_date" };
+    if (/\btime\b/i.test(lower) || /\bslot\b/i.test(lower)) return { shouldSwitch: true, targetStage: session.availableSlotsForDate && session.availableSlotsForDate.length > 5 ? "awaiting_time_preference" : "awaiting_time_selection", reason: "user_wants_different_time" };
+    if (/\bspecialization\b/i.test(lower) || /\bspecialist\b/i.test(lower) || /\bcondition\b/i.test(lower)) return { shouldSwitch: true, targetStage: "awaiting_symptom_or_request", reason: "user_wants_different_specialization" };
+    if (/\bstart over\b/i.test(lower) || /\bnew booking\b/i.test(lower)) return { shouldSwitch: true, targetStage: "awaiting_symptom_or_request", reason: "user_wants_restart" };
+  }
 
-  // Context switches by stage
+  // Implicit context switches based on content
+  const mentionsDoctor = /\b(dr\.?\s*[a-z]|[a-z]+\s+(sharma|verma|singh|kumar|patel|gupta))\b/i.test(lower);
+  const mentionsDate = containsMonthMention(userText) || /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}(st|nd|rd|th))\b/i.test(lower);
+  const mentionsTime = /\b\d{1,2}(:\d{2})?\s?(am|pm|o'?clock)\b/i.test(lower);
+  const mentionsSpecialization = /\b(orthopedic|cardiologist|dermatologist|general\s+medicine|pediatric|gynecologist|ent|neurologist)\b/i.test(lower);
+
   switch (currentStage) {
-    case "awaiting_doctor_selection":
-      return mentionsDate || mentionsTime;
-
-    case "awaiting_date_selection":
-      return mentionsTime || (mentionsDoctor && intent === "symptom_or_specialization_query");
-
     case "awaiting_time_selection":
     case "awaiting_time_preference":
-      return mentionsDate || (mentionsDoctor && intent === "symptom_or_specialization_query");
+      if (mentionsDate && !mentionsTime) {
+        // User mentioned a different date while selecting time
+        const dateResult = resolveDateSelection(userText, session.availableDates ?? []);
+        if (dateResult.matchedIso && dateResult.matchedIso !== session.selectedDate) {
+          return { shouldSwitch: true, targetStage: "awaiting_date_selection", reason: "date_change_during_time_selection" };
+        }
+      }
+      if (mentionsDoctor) {
+        return { shouldSwitch: true, targetStage: "awaiting_doctor_selection", reason: "doctor_change_during_time_selection" };
+      }
+      break;
 
-    default:
-      return false;
+    case "awaiting_date_selection":
+      if (mentionsDoctor) {
+        return { shouldSwitch: true, targetStage: "awaiting_doctor_selection", reason: "doctor_change_during_date_selection" };
+      }
+      if (mentionsSpecialization) {
+        return { shouldSwitch: true, targetStage: "awaiting_symptom_or_request", reason: "specialization_change_during_date_selection" };
+      }
+      break;
+
+    case "awaiting_doctor_selection":
+      if (mentionsSpecialization) {
+        return { shouldSwitch: true, targetStage: "awaiting_symptom_or_request", reason: "specialization_change_during_doctor_selection" };
+      }
+      if (mentionsDate) {
+        // User jumped ahead - that's fine, but if they mention a different doctor later, handle it
+        return { shouldSwitch: false, targetStage: null, reason: "forward_jump_allowed" };
+      }
+      break;
+
+    case "awaiting_patient_phone":
+    case "awaiting_patient_name":
+    case "awaiting_confirmation":
+      // Allow going back to change doctor/date/time even at the end
+      if (mentionsDoctor) return { shouldSwitch: true, targetStage: "awaiting_doctor_selection", reason: "doctor_change_during_final_stages" };
+      if (mentionsDate && !mentionsDoctor) return { shouldSwitch: true, targetStage: "awaiting_date_selection", reason: "date_change_during_final_stages" };
+      if (mentionsTime && !mentionsDate && !mentionsDoctor) return { shouldSwitch: true, targetStage: "awaiting_time_selection", reason: "time_change_during_final_stages" };
+      break;
+
+    case "cancelling_confirm":
+      // If the user says "first one", "different", etc. during the confirmation step, they want to change their selection
+      if (/\b(change|different|other|first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th|appointment)\b/i.test(lower)) {
+        // Only if they actually have multiple appointments to choose from
+        if (session.lastAppointments && session.lastAppointments.length > 1) {
+          return { shouldSwitch: true, targetStage: "cancelling_select_appointment", reason: "user_changed_appointment_to_cancel" };
+        }
+      }
+      break;
   }
+
+  return { shouldSwitch: false, targetStage: null, reason: "no_switch" };
 }

@@ -66,7 +66,19 @@ export default function ChatVoiceUI() {
   // requiring a tap for every single turn. Tapping the orb while listening
   // manually "hangs up" (turns this back off).
   const callActiveRef = useRef(false);
+  useEffect(() => {
+    if (!speechSupported) return;
 
+    const greeting =
+      "Hi, I'm Maya. What symptoms are you having, or who would you like to see today?";
+
+    const timer = setTimeout(() => {
+      callActiveRef.current = true; // start the live call
+      speak(greeting, { autoListenAfter: true });
+    }, 300);
+
+    return () => clearTimeout(timer);
+  }, [speechSupported]);
   useEffect(() => {
     const SpeechRecognitionCtor =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;

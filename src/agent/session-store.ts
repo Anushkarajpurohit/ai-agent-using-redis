@@ -10,6 +10,7 @@ export async function loadSession(sessionId: string): Promise<ConversationSessio
 
   const fresh: ConversationSession = {
     sessionId,
+    goal: "none",
     stage: "greeting",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),

@@ -167,6 +167,8 @@ function templateFallback(facts: TurnFacts): string {
       }
       return "Sorry, I didn't quite catch that — could you rephrase?";
     }
+    case "workflow_switched":
+      return "Sure, let me help you with that instead.";
     case "goodbye":
       return "Thanks for calling, take care!";
     default:
@@ -200,6 +202,7 @@ const DETERMINISTIC_ONLY_ACTIONS = new Set<TurnFacts["action"]>([
   "list_slots",                // ← ADD (prevents LLM truncating 10 slots to 2)
   "ask_time_preference",       // ← ADD
   "no_slots_in_period",
+  "workflow_switched",
 ]);
 
 // Extra safety net for the remaining (lower-stakes, more conversational)

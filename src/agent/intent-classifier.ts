@@ -26,6 +26,16 @@ const TIME_RE = /\b\d{1,2}(:\d{2})?\s?(am|pm)\b/i;
 
 export function classifyIntent(userText: string, stage: ConversationStage): Intent {
   const text = userText.trim();
+  const lower = text.toLowerCase();
+  if (stage === "cancelling_confirm" || stage === "awaiting_confirmation") {
+    if (YES_RE.test(text)) return "confirm_yes";
+    if (NO_RE.test(text)) return "confirm_no";
+  }
+  if (/\b(change|switch|different|another|go back|not this|wrong)\b/i.test(lower)) {
+    if (/\bdoctor\b/i.test(lower)) return "doctor_selection";
+    if (/\bdate\b/i.test(lower) || /\bday\b/i.test(lower)) return "date_selection";
+    if (/\btime\b/i.test(lower)) return "time_selection";
+  }
 
   if (GOODBYE_RE.test(text)) return "goodbye";
   if (BARE_GREETING_RE.test(text) && stage === "greeting") {
@@ -73,6 +83,7 @@ export function classifyIntent(userText: string, stage: ConversationStage): Inte
         return "time_selection";
       break;
     case "awaiting_time_selection":
+
     case "showing_slots":
       if (TIME_RE.test(text.replace(/\./g, ""))) {
         return "time_selection";
@@ -111,17 +122,20 @@ export function classifyIntent(userText: string, stage: ConversationStage): Inte
       break;
   }
 
+
   // Fall through: generic yes/no still useful outside their "home" stage
   if (YES_RE.test(text)) return "confirm_yes";
   if (NO_RE.test(text)) return "confirm_no";
 
-  // Anything else at the start of a conversation, or containing free text
-  // about how the patient feels, is treated as a symptom/specialization
-  // query — this is deliberately the most common fallback since Maya is a
-  // medical receptionist and most first turns describe a complaint.
+  // Anything else that wasn't caught by a specific stage handler
+  // is treated as a potential new booking request (symptom, doctor request, etc.)
+  // The orchestrator will determine if it's valid.
   if (stage === "greeting" || stage === "awaiting_symptom_or_request") {
     return "symptom_or_specialization_query";
   }
 
-  return "unknown";
+  // If we are in a different stage but the user says something unrecognized,
+  // it might be a context switch (e.g. "I have a headache" during phone collection).
+  // We classify it as new_booking_request to let the orchestrator evaluate it.
+  return "new_booking_request";
 }
