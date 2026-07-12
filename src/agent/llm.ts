@@ -1,9 +1,13 @@
 import { TurnFacts } from "./types";
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:3b";
+// const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+// const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:3b";
 const TIMEOUT_MS = parseInt(process.env.LLM_PHRASING_TIMEOUT_MS || "15000", 10);
 
+
+const _GROQ_BASE_URL = process.env.GROQ_BASE_URL;
+const _GROQ_MODEL = process.env.GROQ_MODEL;
+const _GROQ_API_KEY = process.env.GROQ_API_KEY;
 /**
  * System prompt is deliberately locked down: the model receives ONLY the
  * `facts` JSON for this turn and is told, explicitly, that it may not
@@ -222,12 +226,15 @@ export async function phraseResponse(facts: TurnFacts): Promise<string> {
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    const res = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    const res = await fetch(`${_GROQ_BASE_URL}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${_GROQ_API_KEY}`,
+      },
       signal: controller.signal,
       body: JSON.stringify({
-        model: OLLAMA_MODEL,
+        model: _GROQ_MODEL,
         temperature: 0.4,
         max_tokens: 120,
         messages: [
@@ -245,6 +252,7 @@ export async function phraseResponse(facts: TurnFacts): Promise<string> {
     if (HALLUCINATION_RED_FLAGS.test(text)) {
       throw new Error(`Suspected hallucination (mentions calling/phone contact): "${text}"`);
     }
+    console.log(`Error: ${_GROQ_BASE_URL}`);
 
     console.log("[LLM] phrased via Ollama:", text);
     return text;

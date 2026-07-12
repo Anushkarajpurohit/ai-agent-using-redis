@@ -2,3 +2,7 @@ node_modules
 .next
 .env.local
 drizzle
+
+.env
+.env.local
+.env.*

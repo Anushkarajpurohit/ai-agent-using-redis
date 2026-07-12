@@ -1,61 +1,162 @@
 import { db, pool } from "./client";
-import { doctors, doctorSlots } from "./schema";
+import { doctors, patients, doctorSlots } from "./schema";
+import { eq } from "drizzle-orm";
 
-const SAMPLE_DOCTORS = [
-  { name: "Dr. Priya Nair", specialization: "general medicine", qualifications: "MBBS, MD", yearsExperience: 12, clinicName: "City Health Clinic", city: "Pune", rating: 48 },
-  { name: "Dr. Arjun Mehta", specialization: "general medicine", qualifications: "MBBS", yearsExperience: 6, clinicName: "Wellness Point", city: "Pune", rating: 44 },
-  { name: "Dr. Sana Sheikh", specialization: "dermatology", qualifications: "MBBS, MD Dermatology", yearsExperience: 9, clinicName: "SkinCare Clinic", city: "Pune", rating: 47 },
-  { name: "Dr. Rohan Kulkarni", specialization: "cardiology", qualifications: "MBBS, DM Cardiology", yearsExperience: 15, clinicName: "Heart Care Center", city: "Pune", rating: 49 },
-  { name: "Dr. Neha Kapoor", specialization: "pediatrics", qualifications: "MBBS, MD Pediatrics", yearsExperience: 8, clinicName: "Little Steps Clinic", city: "Pune", rating: 46 },
-];
+async function seed() {
+  console.log("Seeding...");
+  console.log("DATABASE_URL:", process.env.DATABASE_URL);
 
-const WORK_START_HOUR = 9;
-const WORK_END_HOUR = 17;
-const SLOT_MINUTES = 30;
+  // Optional: clear existing data
+  await db.delete(doctorSlots);
+  await db.delete(patients);
+  await db.delete(doctors);
 
-function pad(n: number) {
-  return String(n).padStart(2, "0");
-}
+  const insertedDoctors = await db
+    .insert(doctors)
+    .values([
+      {
+        name: "Dr. Neha Kapoor",
+        specialization: "general_medicine",
+        qualifications: "MBBS, MD",
+        yearsExperience: 12,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 48,
+      },
+      {
+        name: "Dr. Rahul Sharma",
+        specialization: "cardiology",
+        qualifications: "MBBS, DM Cardiology",
+        yearsExperience: 15,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 49,
+      },
+      {
+        name: "Dr. Priya Mehta",
+        specialization: "dermatology",
+        qualifications: "MBBS, MD Dermatology",
+        yearsExperience: 11,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 47,
+      },
+      {
+        name: "Dr. Amit Joshi",
+        specialization: "orthopedics",
+        qualifications: "MBBS, MS Orthopedics",
+        yearsExperience: 18,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 48,
+      },
+      {
+        name: "Dr. Sneha Kulkarni",
+        specialization: "gynecology",
+        qualifications: "MBBS, MS Obstetrics & Gynecology",
+        yearsExperience: 14,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 49,
+      },
+      {
+        name: "Dr. Arjun Deshmukh",
+        specialization: "neurology",
+        qualifications: "MBBS, DM Neurology",
+        yearsExperience: 16,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 48,
+      },
+      {
+        name: "Dr. Kavita Patil",
+        specialization: "pediatrics",
+        qualifications: "MBBS, MD Pediatrics",
+        yearsExperience: 13,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 48,
+      },
+      {
+        name: "Dr. Vikram Singh",
+        specialization: "ent",
+        qualifications: "MBBS, MS ENT",
+        yearsExperience: 17,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 46,
+      },
+      {
+        name: "Dr. Meera Shah",
+        specialization: "ophthalmology",
+        qualifications: "MBBS, MS Ophthalmology",
+        yearsExperience: 12,
+        clinicName: "City Care Clinic",
+        city: "Pune",
+        rating: 47,
+      },
+    ])
+    .returning();
 
-async function main() {
-  console.log("Seeding doctors...");
-  const inserted = await db.insert(doctors).values(SAMPLE_DOCTORS).returning({ id: doctors.id });
+  await db.insert(patients).values([
+    {
+      name: "Anushka Rajpurohit",
+      phone: "9876543210",
+    },
+    {
+      name: "Rahul Verma",
+      phone: "9876543211",
+    },
+  ]);
 
-  console.log("Generating 14 days of slots per doctor...");
   const today = new Date();
-  const slotRows: (typeof doctorSlots.$inferInsert)[] = [];
 
-  for (const { id: doctorId } of inserted) {
-    for (let dayOffset = 0; dayOffset < 14; dayOffset++) {
+  const slots = [];
+
+  for (const doctor of insertedDoctors) {
+    for (let d = 0; d < 10; d++) {
       const date = new Date(today);
-      date.setDate(date.getDate() + dayOffset);
-      // skip Sundays
-      if (date.getDay() === 0) continue;
+      date.setDate(today.getDate() + d);
 
-      const dateStr = date.toISOString().slice(0, 10);
-      for (let hour = WORK_START_HOUR; hour < WORK_END_HOUR; hour++) {
-        for (let min = 0; min < 60; min += SLOT_MINUTES) {
-          const start = `${pad(hour)}:${pad(min)}:00`;
-          const endMin = min + SLOT_MINUTES;
-          const end = `${pad(endMin >= 60 ? hour + 1 : hour)}:${pad(endMin % 60)}:00`;
-          slotRows.push({
-            doctorId,
-            slotDate: dateStr,
+      const slotDate = date.toISOString().split("T")[0];
+
+      for (let hour = 9; hour < 17; hour++) {
+        for (const minute of [0, 30]) {
+          const start = `${hour.toString().padStart(2, "0")}:${minute
+            .toString()
+            .padStart(2, "0")}:00`;
+
+          const endDate = new Date();
+          endDate.setHours(hour, minute + 30);
+
+          const end = `${endDate
+            .getHours()
+            .toString()
+            .padStart(2, "0")}:${endDate
+              .getMinutes()
+              .toString()
+              .padStart(2, "0")}:00`;
+
+          slots.push({
+            doctorId: doctor.id,
+            slotDate,
             startTime: start,
             endTime: end,
-            isBooked: false,
           });
         }
       }
     }
   }
 
-  await db.insert(doctorSlots).values(slotRows);
-  console.log(`Inserted ${inserted.length} doctors and ${slotRows.length} slots.`);
-  await pool.end();
+  await db.insert(doctorSlots).values(slots);
+
+  console.log(`Inserted ${insertedDoctors.length} doctors`);
+  console.log(`Inserted ${slots.length} slots`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+seed()
+  .then(() => {
+    console.log("Done");
+    process.exit(0);
+  })
+  .catch(console.error);

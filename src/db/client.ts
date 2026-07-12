@@ -12,7 +12,7 @@ declare global {
 const pool =
   global.__mayaPgPool ??
   new Pool({
-    connectionString: process.env.DATABASE_URL,
+    connectionString: "postgresql://postgres:QVpGNIfjgFihQRBRZoeQJVyHbdSgEjBl@hayabusa.proxy.rlwy.net:27620/railway",
     max: 10,
     idleTimeoutMillis: 30_000,
   });
