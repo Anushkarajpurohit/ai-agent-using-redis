@@ -258,6 +258,8 @@ export async function phraseResponse(facts: TurnFacts): Promise<string> {
     return text;
   } catch (err) {
     clearTimeout(timeout);
+    console.log(`Error: ${_GROQ_BASE_URL}`);
+
     console.warn("[LLM] Ollama unavailable/slow/unreliable, using deterministic template fallback:", (err as Error).message);
     return templateFallback(facts);
   }
