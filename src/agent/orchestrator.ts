@@ -104,7 +104,7 @@ function resolveIntentAndWorkflow(
 
   // If the user explicitly asks for a workflow switch:
   if (wantsReschedule && session.goal !== "reschedule") return { intent: "reschedule_appointment", workflowAction: "switch", newGoal: "reschedule" };
-  
+
   if (wantsCancel && session.goal !== "cancellation") {
     if (!(stage === "cancelling_confirm" && /\b(don'?t|do not|never|abort|stop)\b/i.test(t))) {
       return { intent: "cancel_appointment", workflowAction: "switch", newGoal: "cancellation" };
@@ -252,10 +252,10 @@ export async function handleTurn(
   // If a workflow switch occurred but we already have the phone (e.g. from previous flow), 
   // we let routeByStage process it normally, but first acknowledge the switch.
   if (workflowAction === "switch" && !facts && newGoal !== "booking") {
-      // Actually, if we switch and have the phone, we should just process the intent through routeByStage.
-      // E.g. routeByStage will handle "awaiting_patient_phone" with intent="cancel_appointment" or "provide_phone"
-      // Wait, if intent is "cancel_appointment" and we are in "awaiting_patient_phone", routeByStage might need to know.
-      // Let's just let routeByStage handle the current state.
+    // Actually, if we switch and have the phone, we should just process the intent through routeByStage.
+    // E.g. routeByStage will handle "awaiting_patient_phone" with intent="cancel_appointment" or "provide_phone"
+    // Wait, if intent is "cancel_appointment" and we are in "awaiting_patient_phone", routeByStage might need to know.
+    // Let's just let routeByStage handle the current state.
   }
 
   if (!facts) {
@@ -270,7 +270,7 @@ export async function handleTurn(
       };
     } else {
       facts = await routeByStage(session, intent, userText);
-      
+
       // If we switched workflow and generated normal facts, wrap it with an acknowledgment
       if (workflowAction === "switch") {
         // Option 1: Just use facts as generated

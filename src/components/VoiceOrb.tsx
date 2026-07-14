@@ -2,11 +2,11 @@
 
 type OrbState = "idle" | "listening" | "thinking" | "speaking";
 
-const STATE_LABEL: Record<OrbState, string> = {
-  idle: "Tap to speak",
-  listening: "Listening…",
-  thinking: "Maya is thinking…",
-  speaking: "Maya is speaking…",
+const PALETTE: Record<OrbState, { core: string; glow: string }> = {
+  idle: { core: "linear-gradient(145deg,#6fa697,#4f8a78)", glow: "rgba(79,138,120,0.30)" },
+  listening: { core: "linear-gradient(145deg,#63b79f,#3c9a7f)", glow: "rgba(60,154,127,0.50)" },
+  thinking: { core: "linear-gradient(145deg,#c9a765,#b0863f)", glow: "rgba(176,134,63,0.42)" },
+  speaking: { core: "linear-gradient(145deg,#5aa7d8,#3c7fb8)", glow: "rgba(60,127,184,0.48)" },
 };
 
 export default function VoiceOrb({
@@ -16,59 +16,90 @@ export default function VoiceOrb({
   state: OrbState;
   onClick: () => void;
 }) {
+  const active = state === "listening" || state === "speaking";
+  const { core, glow } = PALETTE[state];
+
   return (
-    <div className="flex flex-col items-center gap-3">
-      <button
-        onClick={onClick}
-        aria-label={STATE_LABEL[state]}
-        className="relative flex items-center justify-center rounded-full focus:outline-none focus-visible:ring-4"
+    <button
+      onClick={onClick}
+      aria-label="Toggle microphone"
+      style={{
+        position: "relative",
+        width: 168,
+        height: 168,
+        border: "none",
+        background: "transparent",
+        cursor: "pointer",
+        display: "grid",
+        placeItems: "center",
+      }}
+    >
+      {/* radiating rings while voice is flowing */}
+      {active &&
+        [0, 1, 2].map((i) => (
+          <span
+            key={i}
+            style={{
+              position: "absolute",
+              width: 132,
+              height: 132,
+              borderRadius: "50%",
+              border: `2px solid ${glow}`,
+              animation: `ripple 2.4s ${i * 0.8}s ease-out infinite`,
+            }}
+          />
+        ))}
+
+      {/* soft halo */}
+      <span
         style={{
-          width: 140,
-          height: 140,
-          background:
-            state === "idle"
-              ? "var(--sage-soft)"
-              : "radial-gradient(circle at 35% 30%, var(--clay), var(--sage))",
-          boxShadow:
-            state === "listening"
-              ? "0 0 0 10px rgba(193,122,84,0.15)"
-              : state === "speaking"
-              ? "0 0 0 10px rgba(67,99,90,0.15)"
-              : "none",
-          transition: "box-shadow 300ms ease, background 400ms ease",
+          position: "absolute",
+          width: 168,
+          height: 168,
+          borderRadius: "50%",
+          background: `radial-gradient(circle, ${glow} 0%, rgba(255,255,255,0) 70%)`,
+          filter: "blur(6px)",
+        }}
+      />
+
+      {/* the core orb */}
+      <span
+        style={{
+          position: "relative",
+          width: 132,
+          height: 132,
+          borderRadius: "50%",
+          background: core,
+          boxShadow: `0 18px 44px ${glow}, inset 0 6px 16px rgba(255,255,255,0.35), inset 0 -10px 22px rgba(0,0,0,0.14)`,
+          display: "grid",
+          placeItems: "center",
+          animation:
+            state === "thinking"
+              ? "orbPulse 1.1s ease-in-out infinite"
+              : active
+                ? "orbPulse 1.8s ease-in-out infinite"
+                : "bob 4s ease-in-out infinite",
+          transition: "background 0.5s ease",
         }}
       >
-        <span
-          className="rounded-full"
-          style={{
-            width: 56,
-            height: 56,
-            background: state === "idle" ? "var(--sage)" : "var(--panel)",
-            animation:
-              state === "listening"
-                ? "maya-pulse 1.1s ease-in-out infinite"
-                : state === "thinking"
-                ? "maya-spin 1.4s linear infinite"
-                : state === "speaking"
-                ? "maya-pulse 0.6s ease-in-out infinite"
-                : "none",
-          }}
-        />
-      </button>
-      <p style={{ fontFamily: "var(--font-body)", color: "var(--sage)", fontSize: 14 }}>
-        {STATE_LABEL[state]}
-      </p>
+        <MicGlyph />
+      </span>
+    </button>
+  );
+}
 
-      <style>{`
-        @keyframes maya-pulse {
-          0%, 100% { transform: scale(1); opacity: 1; }
-          50% { transform: scale(0.75); opacity: 0.7; }
-        }
-        @keyframes maya-spin {
-          0% { transform: rotate(0deg); border-radius: 40%; }
-          100% { transform: rotate(360deg); border-radius: 50%; }
-        }
-      `}</style>
-    </div>
+function MicGlyph() {
+  return (
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" style={{ opacity: 0.92 }}>
+      <rect x="9" y="3" width="6" height="11" rx="3" fill="#fff" />
+      <path
+        d="M6 11a6 6 0 0 0 12 0"
+        stroke="#fff"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        fill="none"
+      />
+      <line x1="12" y1="17" x2="12" y2="21" stroke="#fff" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
   );
 }
