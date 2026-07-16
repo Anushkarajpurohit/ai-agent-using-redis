@@ -4,7 +4,7 @@
  * ChatVoiceUI — server-side STT + TTS edition
  *
  * Voice I/O pipeline:
- *   Mic (MediaRecorder → WebM blob)
+ *   Mic (MediaRecorder → WebM blob, turn-taking decided by Silero VAD)
  *     → POST /api/stt  (proxied to local faster-whisper Docker sidecar)
  *     → text  →  POST /api/chat  (orchestrator — UNCHANGED)
  *     → reply text  →  POST /api/tts  (msedge-tts, Microsoft neural voice)
@@ -12,9 +12,17 @@
  *
  * Works in ALL browsers (Chrome, Firefox, Safari, Edge) because MediaRecorder
  * and the Fetch API are universal — no Web Speech API required.
+ *
+ * Turn-taking (when to stop recording) is decided by @ricky0123/vad-web, a
+ * local, free, in-browser Silero VAD model — not an amplitude/silence timer.
+ * It runs on-device (ONNX/WASM, assets self-hosted from public/vad/, no
+ * network call), and actually classifies speech vs. non-speech per frame
+ * instead of guessing from volume, which is what was cutting people off
+ * mid-sentence on an ordinary pause.
  */
 
 import { useEffect, useRef, useState } from "react";
+import { MicVAD } from "@ricky0123/vad-web";
 import VoiceOrb from "./VoiceOrb";
 import VoiceWave from "./VoiceWave";
 
@@ -48,10 +56,9 @@ const CAPTION: Record<OrbState, string> = {
   speaking: "Maya is speaking",
 };
 
-// Silence detection tuning
-const SILENCE_RMS_THRESHOLD = 8;  // amplitude 0–100; below this = silence
-const SILENCE_DURATION_MS = 1800; // stop recording after 1.8 s of silence
-const MAX_RECORDING_MS = 30_000;  // safety cap: 30 s
+// Turn-taking tuning
+const VAD_REDEMPTION_MS = 700;    // ms of VAD-judged silence after real speech before ending the turn
+const MAX_RECORDING_MS = 30_000;  // absolute safety cap regardless of VAD, e.g. if the model fails to load
 
 export default function ChatVoiceUI() {
   const [messages, setMessages] = useState<Message[]>([
@@ -68,20 +75,34 @@ export default function ChatVoiceUI() {
   const callActiveRef = useRef(false);
   const sendToAgentRef = useRef<(text: string) => void>(() => { });
 
+  // Mirrors orbState synchronously. The conversational auto-continue chain
+  // (speak() -> finish() -> startListening()) runs across awaits inside
+  // closures captured at various past renders, so reading React's `orbState`
+  // there is stale — it never reflects the setOrbState() calls made earlier
+  // in the very same chain. This ref is updated in lockstep via
+  // setOrb() below and is what internal readiness guards check instead.
+  const orbStateRef = useRef<OrbState>("idle");
+  function setOrb(next: OrbState) {
+    orbStateRef.current = next;
+    setOrbState(next);
+  }
+
   // MediaRecorder state
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
 
-  // Silence detection
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const silenceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Turn-taking (Silero VAD) + absolute safety cap
+  const vadRef = useRef<MicVAD | null>(null);
   const maxTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const silentMsRef = useRef(0);
 
   // Current TTS playback
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Bumped on every speak() call so a slower, superseded call (e.g. the
+  // "one moment..." filler racing the real reply that arrived while it was
+  // still fetching) can detect it's stale and skip playing instead of
+  // talking over whichever call started after it.
+  const speakGenRef = useRef(0);
 
   // ─── lifecycle ───────────────────────────────────────────────────────────
 
@@ -111,23 +132,10 @@ export default function ChatVoiceUI() {
     sendToAgentRef.current = sendToAgent;
   });
 
-  // ─── silence detection helper ────────────────────────────────────────────
-
-  function getRmsLevel(analyser: AnalyserNode): number {
-    const buf = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(buf);
-    let sum = 0;
-    for (let i = 0; i < buf.length; i++) {
-      const v = (buf[i] - 128) / 128;
-      sum += v * v;
-    }
-    return Math.sqrt(sum / buf.length) * 100;
-  }
-
   // ─── recording ───────────────────────────────────────────────────────────
 
   async function startListening() {
-    if (!micSupported || orbState !== "idle") return;
+    if (!micSupported || orbStateRef.current !== "idle") return;
 
     // Interrupt any playing TTS
     stopAudio();
@@ -141,14 +149,6 @@ export default function ChatVoiceUI() {
       return;
     }
     streamRef.current = stream;
-
-    // Audio context for silence detection
-    const ctx = new AudioContext();
-    audioCtxRef.current = ctx;
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    analyserRef.current = analyser;
-    ctx.createMediaStreamSource(stream).connect(analyser);
 
     // Pick a supported MIME type
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -168,42 +168,59 @@ export default function ChatVoiceUI() {
       const blob = new Blob(chunksRef.current, { type: mimeType });
       if (blob.size < 500) {
         // Essentially empty recording — skip
-        if (callActiveRef.current) setOrbState("idle");
+        if (callActiveRef.current) {
+          setOrb("idle");
+          startListening();
+        }
         return;
       }
       await sendAudioToSTT(blob);
     };
 
     recorder.start(100); // deliver data every 100 ms
-    setOrbState("listening");
-    silentMsRef.current = 0;
+    setOrb("listening");
 
-    // Silence detector: check every 200 ms
-    silenceIntervalRef.current = setInterval(() => {
-      if (!analyserRef.current) return;
-      const rms = getRmsLevel(analyserRef.current);
-      if (rms < SILENCE_RMS_THRESHOLD) {
-        silentMsRef.current += 200;
-        if (silentMsRef.current >= SILENCE_DURATION_MS) {
-          stopRecording();
-        }
-      } else {
-        silentMsRef.current = 0;
-      }
-    }, 200);
+    // Voice-activity detection decides when the user is actually done
+    // speaking — a real per-frame speech/non-speech classification, not an
+    // amplitude threshold — instead of stopRecording() firing off a blind
+    // silence timer. Shares the same MediaStream as the recorder above, so
+    // permission is only requested once and both consume the same mic.
+    try {
+      const vad = await MicVAD.new({
+        baseAssetPath: "/vad/",
+        onnxWASMBasePath: "/vad/",
+        getStream: async () => stream,
+        // Default pauseStream stops the shared stream's tracks, which would
+        // cut MediaRecorder off too — we own the stream's lifecycle via
+        // cleanupMic() instead, so make VAD's own pause/resume a no-op on it.
+        pauseStream: async () => { },
+        resumeStream: async () => stream,
+        redemptionMs: VAD_REDEMPTION_MS,
+        onSpeechEnd: () => stopRecording(),
+        onVADMisfire: () => {
+          // Too short to be real speech (a click, a cough) — keep listening.
+        },
+      });
+      vadRef.current = vad;
+    } catch (err) {
+      console.error("[VAD] failed to load — falling back to the safety timer only:", err);
+    }
 
-    // Safety cap
+    // Absolute safety cap regardless of VAD (e.g. if it failed to load).
     maxTimerRef.current = setTimeout(() => stopRecording(), MAX_RECORDING_MS);
   }
 
   function stopRecording() {
-    if (silenceIntervalRef.current) {
-      clearInterval(silenceIntervalRef.current);
-      silenceIntervalRef.current = null;
-    }
     if (maxTimerRef.current) {
       clearTimeout(maxTimerRef.current);
       maxTimerRef.current = null;
+    }
+    if (vadRef.current) {
+      const vad = vadRef.current;
+      vadRef.current = null;
+      // Deferred so destroy() doesn't tear down VAD state from inside its
+      // own onSpeechEnd callback's call stack.
+      setTimeout(() => void vad.destroy(), 0);
     }
     if (recorderRef.current?.state === "recording") {
       recorderRef.current.stop(); // triggers recorder.onstop
@@ -213,15 +230,12 @@ export default function ChatVoiceUI() {
   function cleanupMic() {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
-    audioCtxRef.current?.close();
-    audioCtxRef.current = null;
-    analyserRef.current = null;
   }
 
   // ─── STT ─────────────────────────────────────────────────────────────────
 
   async function sendAudioToSTT(blob: Blob) {
-    setOrbState("thinking");
+    setOrb("thinking");
     const form = new FormData();
     form.append("audio", blob, "recording.webm");
 
@@ -232,7 +246,7 @@ export default function ChatVoiceUI() {
 
       if (!transcript) {
         // Nothing recognised — go back to idle and re-listen if call is live
-        setOrbState("idle");
+        setOrb("idle");
         if (callActiveRef.current) startListening();
         return;
       }
@@ -240,7 +254,7 @@ export default function ChatVoiceUI() {
       await sendToAgentRef.current(transcript);
     } catch (err) {
       console.error("[STT fetch] error:", err);
-      setOrbState("idle");
+      setOrb("idle");
     }
   }
 
@@ -250,7 +264,7 @@ export default function ChatVoiceUI() {
     if (!sessionId) return;
     callActiveRef.current = true;
     setMessages((m) => [...m, { role: "user", text: userText }]);
-    setOrbState("thinking");
+    setOrb("thinking");
 
     let settled = false;
     const holdTimer = setTimeout(() => {
@@ -289,9 +303,31 @@ export default function ChatVoiceUI() {
 
   // ─── TTS ─────────────────────────────────────────────────────────────────
 
+  /** Browser-native fallback so the agent is never silent just because the
+   *  network TTS call failed (e.g. Edge TTS unreachable) — lower quality,
+   *  but always available offline/locally. */
+  function speakWithBrowserVoice(text: string): Promise<void> {
+    return new Promise((resolve) => {
+      if (!("speechSynthesis" in window)) return resolve();
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.onend = () => resolve();
+      utter.onerror = () => resolve();
+      window.speechSynthesis.speak(utter);
+    });
+  }
+
   async function speak(text: string, opts?: { autoListenAfter?: boolean }) {
-    setOrbState("speaking");
+    const myGen = ++speakGenRef.current;
+    const stillCurrent = () => myGen === speakGenRef.current;
+
+    setOrb("speaking");
     stopAudio(); // cancel any previous playback
+
+    const finish = () => {
+      if (!stillCurrent()) return;
+      setOrb("idle");
+      if (opts?.autoListenAfter && callActiveRef.current) startListening();
+    };
 
     try {
       const res = await fetch("/api/tts", {
@@ -303,15 +339,16 @@ export default function ChatVoiceUI() {
       if (!res.ok) throw new Error(`TTS ${res.status}`);
 
       const blob = await res.blob();
+      if (!stillCurrent()) return; // a newer speak() call has since taken over
+
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       currentAudioRef.current = audio;
 
       const onDone = () => {
         URL.revokeObjectURL(url);
-        currentAudioRef.current = null;
-        setOrbState("idle");
-        if (opts?.autoListenAfter && callActiveRef.current) startListening();
+        if (currentAudioRef.current === audio) currentAudioRef.current = null;
+        finish();
       };
 
       audio.onended = onDone;
@@ -323,8 +360,9 @@ export default function ChatVoiceUI() {
       await audio.play();
     } catch (err) {
       console.error("[TTS fetch] error:", err);
-      setOrbState("idle");
-      if (opts?.autoListenAfter && callActiveRef.current) startListening();
+      if (!stillCurrent()) return;
+      await speakWithBrowserVoice(text);
+      finish();
     }
   }
 
@@ -343,12 +381,12 @@ export default function ChatVoiceUI() {
   // ─── UI handlers ─────────────────────────────────────────────────────────
 
   function toggleMic() {
-    if (orbState === "listening") {
+    if (orbStateRef.current === "listening") {
       callActiveRef.current = false; // manual hang-up
       stopRecording();
       return;
     }
-    if (orbState !== "idle") return;
+    if (orbStateRef.current !== "idle") return;
     callActiveRef.current = true;
     startListening();
   }
@@ -357,7 +395,7 @@ export default function ChatVoiceUI() {
     callActiveRef.current = false;
     stopAudio();
     stopRecording();
-    setOrbState("idle");
+    setOrb("idle");
   }
 
   function handleTextSubmit(e: React.FormEvent) {

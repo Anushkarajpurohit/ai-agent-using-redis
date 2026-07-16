@@ -15,6 +15,29 @@ import { NextRequest, NextResponse } from "next/server";
 const WHISPER_URL =
   process.env.WHISPER_URL || "http://localhost:8000/v1/audio/transcriptions";
 
+/**
+ * Whisper-family models hallucinate short filler phrases ("Okay.", "All
+ * right.", "Thank you.") repeated dozens of times when fed audio that's
+ * mostly silence/noise — a known failure mode, not a real utterance. If a
+ * short phrase dominates the transcript, treat it as noise rather than
+ * forwarding it to the orchestrator as something the caller actually said.
+ */
+function isHallucinatedRepeat(text: string): boolean {
+  const sentences = text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.replace(/[.!?]+$/, "").trim().toLowerCase())
+    .filter(Boolean);
+
+  if (sentences.length < 5) return false;
+
+  const counts = new Map<string, number>();
+  for (const s of sentences) counts.set(s, (counts.get(s) ?? 0) + 1);
+  const [mostCommon, count] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+
+  const wordCount = mostCommon.split(/\s+/).filter(Boolean).length;
+  return wordCount <= 4 && count / sentences.length >= 0.7;
+}
+
 export async function POST(req: NextRequest) {
   let formData: FormData;
   try {
@@ -50,7 +73,13 @@ export async function POST(req: NextRequest) {
     }
 
     const data = await res.json();
-    const transcript: string = data.text?.trim() ?? "";
+    let transcript: string = data.text?.trim() ?? "";
+
+    if (transcript && isHallucinatedRepeat(transcript)) {
+      console.warn(`[STT] discarding likely hallucinated repeat: "${transcript.slice(0, 80)}..."`);
+      transcript = "";
+    }
+
     console.log(`[STT] transcript: "${transcript}"`);
     return NextResponse.json({ transcript });
   } catch (err) {

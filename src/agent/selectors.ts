@@ -64,6 +64,19 @@ export function resolveDoctorSelection(
   if (idx !== null && candidates[idx]) return candidates[idx];
 
   if (candidates.length === 1 && AFFIRMATIVE_OR_PRONOUN_RE.test(lower)) {
+    // "book" and "yes" match too loosely to just trust blindly — "Book
+    // appointment with Dr. Neha Kapoor" also matches "book", but the user
+    // is explicitly naming a DIFFERENT doctor than the one on offer. Don't
+    // let the loose affirmative match silently override an explicit name
+    // that doesn't belong to this candidate — let the caller fall through
+    // to a fresh name lookup instead.
+    const explicitName = extractDoctorNameQuery(userText);
+    if (explicitName) {
+      const candidateName = candidates[0].name.toLowerCase().replace(/^dr\.?\s*/i, "");
+      if (!candidateName.includes(explicitName.toLowerCase())) {
+        return null;
+      }
+    }
     return candidates[0];
   }
 
@@ -218,8 +231,29 @@ export function resolveDateSelection(userText: string, availableDates: string[])
   const idx = findWordOrdinalIndex(userText);
   if (idx !== null && availableDates[idx]) return { matchedIso: availableDates[idx] };
 
+  // 3. Vague "whatever's free" style requests -> earliest offered date.
+  if (SOON_RE.test(lower) && availableDates.length > 0) {
+    return { matchedIso: [...availableDates].sort()[0] };
+  }
+  if (LATER_RE.test(lower) && availableDates.length > 0) {
+    return { matchedIso: [...availableDates].sort().at(-1)! };
+  }
+
   return { matchedIso: null };
 }
+
+// ---------------------------------------------------------------------------
+// "Whatever's free" style requests — no specific date/time in mind, just
+// wants the soonest option offered. Shared by date and time resolution.
+// ---------------------------------------------------------------------------
+const SOON_RE =
+  /\b(earliest|earlier|sooner|soonest|asap|as soon as possible|next available|first available|whatever'?s?\s*(free|available|open)|any (time|slot|day)|no preference|doesn'?t matter|you (choose|pick|decide))\b/i;
+
+// Mirror of SOON_RE for the opposite direction ("the later one", "whichever
+// is last") — small local LLMs proved unreliable at this exact kind of
+// relative comparison (see resolveAmbiguousChoice), so it's handled here
+// deterministically instead of being left to the LLM fallback.
+const LATER_RE = /\b(later|latest|last one|the last|whichever is later)\b/i;
 
 // ---------------------------------------------------------------------------
 // Time selection
@@ -235,6 +269,51 @@ function to12Hour(hour: number, minute: number): string {
   const period = hour >= 12 ? "PM" : "AM";
   const hour12 = hour % 12 === 0 ? 12 : hour % 12;
   return `${hour12}:${String(minute).padStart(2, "0")} ${period}`;
+}
+
+// Bare/spoken hour handling ("9", "nine", "9 o'clock", "half past 9",
+// "quarter to 9") — none of these carry am/pm, so we match purely by the
+// 12-hour clock position against whatever slots are actually offered.
+const WORD_NUMBERS: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6,
+  seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
+};
+const NUMBER_WORD_ALTERNATION = Object.keys(WORD_NUMBERS).join("|");
+
+function wordOrDigitHour(token: string): number | null {
+  if (/^\d{1,2}$/.test(token)) {
+    const n = parseInt(token, 10);
+    return n >= 1 && n <= 12 ? n : null;
+  }
+  return WORD_NUMBERS[token] ?? null;
+}
+
+function slotHour12(slot: SlotRecord): number {
+  const h = parseInt(slot.startTime.split(":")[0], 10) % 12;
+  return h === 0 ? 12 : h;
+}
+
+function slotMinute(slot: SlotRecord): number {
+  return parseInt(slot.startTime.split(":")[1], 10);
+}
+
+function matchSlotsByHour12(hour12: number, slots: SlotRecord[]): SlotRecord[] {
+  return slots.filter((s) => slotHour12(s) === hour12);
+}
+
+/** Among same-hour candidates, prefer an exact minute match, then the
+ *  top-of-the-hour slot (what a bare hour like "9" means in everyday
+ *  speech), then the earliest of what's left. */
+function pickAmongAmbiguous(candidates: SlotRecord[], minute: number | null): SlotRecord | null {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  if (minute !== null) {
+    const exact = candidates.find((s) => slotMinute(s) === minute);
+    if (exact) return exact;
+  }
+  const onHour = candidates.find((s) => slotMinute(s) === 0);
+  if (onHour) return onHour;
+  return [...candidates].sort((a, b) => a.startTime.localeCompare(b.startTime))[0];
 }
 export async function searchDoctorsByName(nameQuery: string) {
   const q = nameQuery.replace(/^dr\.?\s+/i, "").trim();
@@ -278,8 +357,70 @@ export function resolveTimeSelection(userText: string, slots: SlotRecord[]): Tim
     return { matchedSlot: null };
   }
 
+  // "half past 9" / "half past nine" -> :30
+  const halfMatch = lower.match(new RegExp(`\\bhalf\\s*(?:past|after)?\\s*(\\d{1,2}|${NUMBER_WORD_ALTERNATION})\\b`));
+  if (halfMatch) {
+    const hour12 = wordOrDigitHour(halfMatch[1]);
+    if (hour12) {
+      const picked = pickAmongAmbiguous(matchSlotsByHour12(hour12, slots), 30);
+      if (picked) return { matchedSlot: picked };
+      return { matchedSlot: null, requestedLabel: `${hour12}:30` };
+    }
+  }
+
+  // "quarter past 9" -> :15
+  const quarterPastMatch = lower.match(new RegExp(`\\bquarter\\s*(?:past|after)\\s*(\\d{1,2}|${NUMBER_WORD_ALTERNATION})\\b`));
+  if (quarterPastMatch) {
+    const hour12 = wordOrDigitHour(quarterPastMatch[1]);
+    if (hour12) {
+      const picked = pickAmongAmbiguous(matchSlotsByHour12(hour12, slots), 15);
+      if (picked) return { matchedSlot: picked };
+      return { matchedSlot: null, requestedLabel: `${hour12}:15` };
+    }
+  }
+
+  // "quarter to 9" -> (9-1):45
+  const quarterToMatch = lower.match(new RegExp(`\\bquarter\\s*to\\s*(\\d{1,2}|${NUMBER_WORD_ALTERNATION})\\b`));
+  if (quarterToMatch) {
+    const hour12 = wordOrDigitHour(quarterToMatch[1]);
+    if (hour12) {
+      const prevHour = hour12 === 1 ? 12 : hour12 - 1;
+      const picked = pickAmongAmbiguous(matchSlotsByHour12(prevHour, slots), 45);
+      if (picked) return { matchedSlot: picked };
+      return { matchedSlot: null, requestedLabel: `${prevHour}:45` };
+    }
+  }
+
+  // Bare hour, spoken or typed, with no minute/meridiem at all: "9", "nine",
+  // "at 9", "9 o'clock". This is deliberately anchored to (almost) the whole
+  // utterance so a stray digit elsewhere in a longer sentence can't misfire.
+  // When more than one offered slot shares that hour (e.g. 9:00 and 9:30),
+  // a bare "9" means the top of the hour — see pickAmongAmbiguous.
+  const bareCandidate = lower.replace(/\bo'?\s*clock\b/g, "").trim();
+  const bareMatch = bareCandidate.match(
+    new RegExp(`^(?:at|around|about|maybe|let'?s say)?\\s*(\\d{1,2}|${NUMBER_WORD_ALTERNATION})\\s*$`)
+  );
+  if (bareMatch) {
+    const hour12 = wordOrDigitHour(bareMatch[1]);
+    if (hour12) {
+      const picked = pickAmongAmbiguous(matchSlotsByHour12(hour12, slots), null);
+      if (picked) return { matchedSlot: picked };
+      return { matchedSlot: null, requestedLabel: `${hour12}:00` };
+    }
+  }
+
+  // List position: "the second one" (word ordinals only — digit forms like
+  // "5th" are reserved for calendar dates, see comment above).
   const idx = findWordOrdinalIndex(userText);
   if (idx !== null && slots[idx]) return { matchedSlot: slots[idx] };
+
+  // Vague "whatever's free" style requests -> earliest offered slot.
+  if (SOON_RE.test(lower) && slots.length > 0) {
+    return { matchedSlot: [...slots].sort((a, b) => a.startTime.localeCompare(b.startTime))[0] };
+  }
+  if (LATER_RE.test(lower) && slots.length > 0) {
+    return { matchedSlot: [...slots].sort((a, b) => a.startTime.localeCompare(b.startTime)).at(-1)! };
+  }
 
   return { matchedSlot: null };
 }

@@ -123,6 +123,22 @@ export function classifyIntent(userText: string, stage: ConversationStage): Inte
   }
 
 
+  // At the symptom-gathering stages, only read the utterance as a plain
+  // confirmation if that's ALL it is ("yes", "sure, go ahead"). YES_RE
+  // matches "yes" as a substring anywhere, so "Yes, skin infection" was
+  // being misread as a bare confirm_yes instead of the actual symptom
+  // answer — which then wrongly fed a stale "resume previous booking"
+  // path instead of describing the new symptom.
+  if (stage === "greeting" || stage === "awaiting_symptom_or_request") {
+    if (/^(yes|yeah|yup|sure|ok|okay|correct|confirm|go ahead)[\s,.!]*$/i.test(text)) {
+      return "confirm_yes";
+    }
+    if (/^(no|nope)[\s,.!]*$/i.test(text)) {
+      return "confirm_no";
+    }
+    return "symptom_or_specialization_query";
+  }
+
   // Fall through: generic yes/no still useful outside their "home" stage
   if (YES_RE.test(text)) return "confirm_yes";
   if (NO_RE.test(text)) return "confirm_no";
@@ -130,9 +146,6 @@ export function classifyIntent(userText: string, stage: ConversationStage): Inte
   // Anything else that wasn't caught by a specific stage handler
   // is treated as a potential new booking request (symptom, doctor request, etc.)
   // The orchestrator will determine if it's valid.
-  if (stage === "greeting" || stage === "awaiting_symptom_or_request") {
-    return "symptom_or_specialization_query";
-  }
 
   // If we are in a different stage but the user says something unrecognized,
   // it might be a context switch (e.g. "I have a headache" during phone collection).

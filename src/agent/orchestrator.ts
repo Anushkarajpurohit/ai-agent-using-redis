@@ -10,7 +10,7 @@ import {
   extractDoctorNameQuery, containsMonthMention
 } from "./selectors";
 import { loadSession, saveSession } from "./session-store";
-import { phraseResponse } from "./llm";
+import { phraseResponse, resolveAmbiguousChoice } from "./llm";
 import { getDoctorsBySpecialization, searchDoctorByName, } from "../db/queries/doctors";
 import { getDoctorWeekAvailability } from "../db/queries/slots";
 import {
@@ -89,6 +89,13 @@ function formatTimeLabel(hhmmss: string): string {
   const hour12 = h % 12 === 0 ? 12 : h % 12;
   return `${hour12}:${String(m).padStart(2, "0")} ${period}`;
 }
+// "which doctor am I even booking with" — a plain informational question
+// that the date/time-selection stages otherwise silently ignore (they only
+// look for a date/time in the utterance, so an unrelated question just gets
+// treated as unparseable and the same date/time list gets re-asked without
+// ever answering what was actually asked).
+const WHICH_DOCTOR_RE = /\b(which|what|who)\s+(is\s+the\s+)?doctor\b|\bwho'?s\s+the\s+doctor\b/i;
+
 function resolveIntentAndWorkflow(
   text: string,
   stage: ConversationSession["stage"],
@@ -367,6 +374,17 @@ async function routeByStage(
   switch (session.stage) {
     case "greeting":
     case "awaiting_symptom_or_request": {
+      // Mark the flow as an active booking as soon as we start gathering a
+      // symptom/doctor request. Without this, session.goal stays "none" for
+      // the entire flow (nothing else ever sets it), so the very next
+      // utterance that doesn't match a stage-specific pattern in
+      // classifyIntent — e.g. "book her" at the doctor-selection stage —
+      // falls through to intent "new_booking_request", and since goal was
+      // still "none" that was read as "start a brand new booking," silently
+      // wiping all progress (doctor/date/slot already chosen) back to this
+      // same stage. That was the single biggest source of mid-flow loops.
+      session.goal = "booking";
+
       // Check if user wants to return to previous booking
       if (intent === "confirm_yes" && session.previousContext?.selectedDoctorId) {
         console.log("[CONTEXT RESTORE] User wants to resume previous booking");
@@ -745,6 +763,52 @@ async function routeByStage(
         };
       }
 
+      // ═══ LAST-RESORT: ask the LLM to match against the exact candidates
+      // already offered (never a doctor outside this list) before giving up
+      // and asking again. Only reached once every deterministic check above
+      // (name, ordinal, specialization switch) has already failed. ═══
+      {
+        const llmCandidates = session.candidateDoctors ?? [];
+        const picked = await resolveAmbiguousChoice(
+          userText,
+          "doctor",
+          llmCandidates.map((d) => ({ label: `${d.name} (${d.specialization})`, value: String(d.id) }))
+        );
+        const doc = picked ? llmCandidates.find((d) => String(d.id) === picked) : null;
+
+        if (doc) {
+          session.selectedDoctorId = doc.id;
+          session.selectedDoctorName = doc.name;
+
+          const week = await getDoctorWeekAvailability(doc.id);
+          const availableDates = Object.keys(week.slotsByDate).filter((d) => week.slotsByDate[d].length > 0);
+          session.availableDates = availableDates;
+
+          if (availableDates.length === 0) {
+            return {
+              intent: intent as any,
+              stage: "awaiting_doctor_selection",
+              nextStage: "awaiting_doctor_selection",
+              action: "clarify_unknown",
+              data: { reason: "no_availability", doctorName: doc.name },
+            };
+          }
+
+          session.stage = "awaiting_date_selection";
+          return {
+            intent: "doctor_selection" as any,
+            stage: "awaiting_doctor_selection",
+            nextStage: "awaiting_date_selection",
+            action: "list_dates",
+            data: {
+              doctorName: doc.name,
+              dates: availableDates.map(formatDateLabel),
+              rawDates: availableDates,
+            },
+          };
+        }
+      }
+
       return {
         intent: intent as any,
         stage: "awaiting_doctor_selection",
@@ -762,6 +826,16 @@ async function routeByStage(
     }
 
     case "awaiting_date_selection": {
+      if (WHICH_DOCTOR_RE.test(userText) && session.selectedDoctorName) {
+        return {
+          intent: intent as any,
+          stage: session.stage,
+          nextStage: session.stage,
+          action: "ask_date_choice",
+          data: { doctorName: session.selectedDoctorName, dates: (session.availableDates ?? []).map(formatDateLabel) },
+        };
+      }
+
       // ═══ HANDLE TIME MENTIONS DURING DATE SELECTION ═══
       const timeResult = resolveTimeSelection(userText, session.availableSlotsForDate ?? []);
       if (timeResult.matchedSlot && session.selectedDate) {
@@ -797,8 +871,9 @@ async function routeByStage(
       }
 
       const result = resolveDateSelection(userText, session.availableDates ?? []);
+      let chosenDate = result.matchedIso;
 
-      if (!result.matchedIso) {
+      if (!chosenDate) {
         if (result.requestedIso) {
           return {
             intent: intent as any,
@@ -811,16 +886,26 @@ async function routeByStage(
             },
           };
         }
-        return {
-          intent: intent as any,
-          stage: session.stage,
-          nextStage: session.stage,
-          action: "ask_date_choice",
-          data: { dates: (session.availableDates ?? []).map(formatDateLabel) },
-        };
+
+        // Last-resort LLM match against the exact dates already offered,
+        // before falling back to asking again.
+        const dateOptions = (session.availableDates ?? []).map((iso) => ({
+          label: formatDateLabel(iso),
+          value: iso,
+        }));
+        chosenDate = await resolveAmbiguousChoice(userText, "date", dateOptions);
+
+        if (!chosenDate) {
+          return {
+            intent: intent as any,
+            stage: session.stage,
+            nextStage: session.stage,
+            action: "ask_date_choice",
+            data: { dates: (session.availableDates ?? []).map(formatDateLabel) },
+          };
+        }
       }
 
-      const chosenDate = result.matchedIso;
       session.selectedDate = chosenDate;
 
       const week = await getDoctorWeekAvailability(session.selectedDoctorId!);
@@ -862,6 +947,25 @@ async function routeByStage(
     }
 
     case "awaiting_time_preference": {
+      if (WHICH_DOCTOR_RE.test(userText) && session.selectedDoctorName) {
+        const allSlots = session.allSlotsForDate ?? session.availableSlotsForDate ?? [];
+        const p = categorizeSlotsByPeriod(allSlots);
+        return {
+          intent: intent as any,
+          stage: session.stage,
+          nextStage: session.stage,
+          action: "ask_time_preference",
+          data: {
+            doctorName: session.selectedDoctorName,
+            date: session.selectedDate ? formatDateLabel(session.selectedDate) : undefined,
+            morningCount: p.morningCount,
+            afternoonCount: p.afternoonCount,
+            eveningCount: p.eveningCount,
+            periods: p.availablePeriods,
+          },
+        };
+      }
+
       // ═══ HANDLE DATE CHANGES DURING TIME PREFERENCE ═══
       const dateSwitch = resolveDateSelection(userText, session.availableDates ?? []);
       if (dateSwitch.matchedIso && dateSwitch.matchedIso !== session.selectedDate) {
@@ -898,6 +1002,22 @@ async function routeByStage(
           data: {
             date: formatDateLabel(dateSwitch.matchedIso),
             times: slots.map((s) => formatTimeLabel(s.startTime)),
+          },
+        };
+      }
+
+      // Understood a specific date (e.g. "24th of July") but it's outside
+      // the offered window — say so plainly instead of silently ignoring it
+      // and re-asking "morning, afternoon, or evening?" as if nothing was said.
+      if (dateSwitch.requestedIso) {
+        return {
+          intent: intent as any,
+          stage: session.stage,
+          nextStage: session.stage,
+          action: "date_unavailable",
+          data: {
+            requestedDate: formatDateLabel(dateSwitch.requestedIso),
+            dates: (session.availableDates ?? []).map(formatDateLabel),
           },
         };
       }
@@ -975,6 +1095,18 @@ async function routeByStage(
     }
 
     case "awaiting_time_selection": {
+      if (WHICH_DOCTOR_RE.test(userText) && session.selectedDoctorName) {
+        return {
+          intent: intent as any,
+          stage: session.stage,
+          nextStage: session.stage,
+          action: "ask_time_choice",
+          data: {
+            doctorName: session.selectedDoctorName,
+            times: (session.availableSlotsForDate ?? []).map((s) => formatTimeLabel(s.startTime)),
+          },
+        };
+      }
 
       // ═══ HANDLE DATE CHANGES DURING TIME SELECTION ═══
       const dateSwitch = resolveDateSelection(userText, session.availableDates ?? []);
@@ -1017,9 +1149,26 @@ async function routeByStage(
         };
       }
 
-      const result = resolveTimeSelection(userText, session.availableSlotsForDate ?? []);
+      // Understood a specific date but it's outside the offered window —
+      // say so instead of silently falling through to "which time?" as if
+      // the date mention was never heard.
+      if (dateSwitch.requestedIso) {
+        return {
+          intent: intent as any,
+          stage: session.stage,
+          nextStage: session.stage,
+          action: "date_unavailable",
+          data: {
+            requestedDate: formatDateLabel(dateSwitch.requestedIso),
+            dates: (session.availableDates ?? []).map(formatDateLabel),
+          },
+        };
+      }
 
-      if (!result.matchedSlot) {
+      const result = resolveTimeSelection(userText, session.availableSlotsForDate ?? []);
+      let chosenSlot = result.matchedSlot;
+
+      if (!chosenSlot) {
         if (result.requestedLabel) {
           return {
             intent: intent as any,
@@ -1032,16 +1181,30 @@ async function routeByStage(
             },
           };
         }
-        return {
-          intent: intent as any,
-          stage: session.stage,
-          nextStage: session.stage,
-          action: "ask_time_choice",
-          data: { times: (session.availableSlotsForDate ?? []).map((s) => formatTimeLabel(s.startTime)) },
-        };
+
+        // Last-resort LLM match against the exact slots already offered
+        // (e.g. "the earlier one", "the first slot you said") before
+        // falling back to asking again.
+        const slotOptions = (session.availableSlotsForDate ?? []).map((s) => ({
+          label: formatTimeLabel(s.startTime),
+          value: String(s.id),
+        }));
+        const pickedId = await resolveAmbiguousChoice(userText, "time", slotOptions);
+        chosenSlot = pickedId
+          ? (session.availableSlotsForDate ?? []).find((s) => String(s.id) === pickedId) ?? null
+          : null;
+
+        if (!chosenSlot) {
+          return {
+            intent: intent as any,
+            stage: session.stage,
+            nextStage: session.stage,
+            action: "ask_time_choice",
+            data: { times: (session.availableSlotsForDate ?? []).map((s) => formatTimeLabel(s.startTime)) },
+          };
+        }
       }
 
-      const chosenSlot = result.matchedSlot;
       session.selectedSlotId = chosenSlot.id;
       session.selectedSlotTime = formatTimeLabel(chosenSlot.startTime);
 
@@ -1626,7 +1789,12 @@ function detectContextSwitch(
   }
 
   // Implicit context switches based on content
-  const mentionsDoctor = /\b(dr\.?\s*[a-z]|[a-z]+\s+(sharma|verma|singh|kumar|patel|gupta))\b/i.test(lower);
+  // NOTE: "[a-z]" (not "[a-z]+") after "dr." previously matched only a single
+  // letter, so it required an immediate word boundary right after it — real
+  // names like "Neha" (N followed by more letters) never matched at all.
+  // Also matches the full spoken-out word "doctor", not just the "Dr."
+  // abbreviation — "can I look for Doctor Amit?" wasn't recognized before.
+  const mentionsDoctor = /\b((?:dr\.?|doctor)\s*[a-z]+|[a-z]+\s+(sharma|verma|singh|kumar|patel|gupta))\b/i.test(lower);
   const mentionsDate = containsMonthMention(userText) || /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}(st|nd|rd|th))\b/i.test(lower);
   const mentionsTime = /\b\d{1,2}(:\d{2})?\s?(am|pm|o'?clock)\b/i.test(lower);
   const mentionsSpecialization = /\b(orthopedic|cardiologist|dermatologist|general\s+medicine|pediatric|gynecologist|ent|neurologist)\b/i.test(lower);
