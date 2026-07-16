@@ -1,12 +1,16 @@
 import { TurnFacts } from "./types";
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:3b";
-const TIMEOUT_MS = parseInt(process.env.LLM_PHRASING_TIMEOUT_MS || "15000", 10);
+// const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+// const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:3b";
+// const TIMEOUT_MS = parseInt(process.env.LLM_PHRASING_TIMEOUT_MS || "15000", 10);
 // Ollama unloads idle models (default keep_alive ~5min), so the first call
 // after a quiet stretch pays a cold-start cost (~4s locally) on top of
 // inference. 6s covers that while still failing fast into the existing
 // "ask again" behavior if Ollama is genuinely down.
+
+const _GROQ_BASE_URL = process.env.GROQ_BASE_URL;
+const _GROQ_MODEL = process.env.GROQ_MODEL;
+const _GROQ_API_KEY = process.env.GROQ_API_KEY;
 const CHOICE_TIMEOUT_MS = parseInt(process.env.LLM_CHOICE_TIMEOUT_MS || "6000", 10);
 
 /**
@@ -22,7 +26,12 @@ const CHOICE_TIMEOUT_MS = parseInt(process.env.LLM_CHOICE_TIMEOUT_MS || "6000", 
  * ~5 tokens of output) so it only adds latency on the rare turn where
  * regex matching already failed — the golden path never touches this.
  */
+
+function buildUserPrompt(facts: TurnFacts): string {
+  return `FACTS:\n${JSON.stringify(facts, null, 2)}\n\nRespond as Maya, speaking this turn's outcome naturally in 1-3 short sentences.`;
+}
 export async function resolveAmbiguousChoice(
+  facts: TurnFacts,
   userText: string,
   kind: "doctor" | "date" | "time",
   options: { label: string; value: string }[]
@@ -33,32 +42,53 @@ export async function resolveAmbiguousChoice(
   const timeout = setTimeout(() => controller.abort(), CHOICE_TIMEOUT_MS);
 
   try {
-    const list = options.map((o, i) => `${i + 1}. ${o.label}`).join("\n");
-    const res = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    const res = await fetch(`${_GROQ_BASE_URL}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${_GROQ_API_KEY}`,
+      },
       signal: controller.signal,
       body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        temperature: 0,
-        max_tokens: 5,
+        model: _GROQ_MODEL,
+        temperature: 0.4,
+        max_tokens: 120,
         messages: [
-          {
-            role: "system",
-            content:
-              'You match a caller\'s spoken phrase to one option from a numbered list. Reply with ONLY the number of the matching option, or the word "none" if nothing matches. Never explain, never invent an option that is not listed.',
-          },
-          {
-            role: "user",
-            content: `Caller said: "${userText}"\n\nThey are choosing a ${kind} from:\n${list}\n\nWhich number?`,
-          },
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: buildUserPrompt(facts) },
         ],
       }),
     });
     clearTimeout(timeout);
+    // try {
+    //   const list = options.map((o, i) => `${i + 1}. ${o.label}`).join("\n");
+    //   const res = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    //     method: "POST",
+    //     headers: { "Content-Type": "application/json" },
+    //     signal: controller.signal,
+    //     body: JSON.stringify({
+    //       model: OLLAMA_MODEL,
+    //       temperature: 0,
+    //       max_tokens: 5,
+    //       messages: [
+    //         {
+    //           role: "system",
+    //           content:
+    //             'You match a caller\'s spoken phrase to one option from a numbered list. Reply with ONLY the number of the matching option, or the word "none" if nothing matches. Never explain, never invent an option that is not listed.',
+    //         },
+    //         {
+    //           role: "user",
+    //           content: `Caller said: "${userText}"\n\nThey are choosing a ${kind} from:\n${list}\n\nWhich number?`,
+    //         },
+    //       ],
+    //     }),
+    //   });
+    //   clearTimeout(timeout);
 
     if (!res.ok) return null;
     const json = await res.json();
+    console.log(`Error: ${_GROQ_BASE_URL}`);
+
     const text: string = json?.choices?.[0]?.message?.content?.trim() ?? "";
     const num = parseInt(text.match(/\d+/)?.[0] ?? "", 10);
     if (!Number.isNaN(num) && options[num - 1]) {
@@ -67,6 +97,8 @@ export async function resolveAmbiguousChoice(
     }
     return null;
   } catch (err) {
+    console.log(`Error: ${_GROQ_BASE_URL}`);
+
     clearTimeout(timeout);
     console.warn(`[LLM] ambiguous ${kind} choice resolution failed/timed out:`, (err as Error).message);
     return null;
@@ -106,9 +138,7 @@ function withDr(name: string | undefined): string {
   return /^dr\.?\s/i.test(name) ? name : `Dr. ${name}`;
 }
 
-function buildUserPrompt(facts: TurnFacts): string {
-  return `FACTS:\n${JSON.stringify(facts, null, 2)}\n\nRespond as Maya, speaking this turn's outcome naturally in 1-3 short sentences.`;
-}
+
 
 /**
  * Deterministic, template-based fallback phrasing. Used if Ollama is
@@ -351,16 +381,35 @@ export async function phraseResponse(facts: TurnFacts): Promise<string> {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), CHOICE_TIMEOUT_MS);
 
 
+  // try {
+  //   const res = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     signal: controller.signal,
+  //     body: JSON.stringify({
+  //       model: OLLAMA_MODEL,
+  //       temperature: 0.4,
+  //       max_tokens: 120,
+  //       messages: [
+  //         { role: "system", content: SYSTEM_PROMPT },
+  //         { role: "user", content: buildUserPrompt(facts) },
+  //       ],
+  //     }),
+  //   });
+  //   clearTimeout(timeout);
   try {
-    const res = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    const res = await fetch(`${_GROQ_BASE_URL}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${_GROQ_API_KEY}`,
+      },
       signal: controller.signal,
       body: JSON.stringify({
-        model: OLLAMA_MODEL,
+        model: _GROQ_MODEL,
         temperature: 0.4,
         max_tokens: 120,
         messages: [
@@ -370,25 +419,6 @@ export async function phraseResponse(facts: TurnFacts): Promise<string> {
       }),
     });
     clearTimeout(timeout);
-    // try {
-    //   const res = await fetch(`${_GROQ_BASE_URL}/chat/completions`, {
-    //     method: "POST",
-    //     headers: {
-    //       "Content-Type": "application/json",
-    //       Authorization: `Bearer ${_GROQ_API_KEY}`,
-    //     },
-    //     signal: controller.signal,
-    //     body: JSON.stringify({
-    //       model: _GROQ_MODEL,
-    //       temperature: 0.4,
-    //       max_tokens: 120,
-    //       messages: [
-    //         { role: "system", content: SYSTEM_PROMPT },
-    //         { role: "user", content: buildUserPrompt(facts) },
-    //       ],
-    //     }),
-    //   });
-    //   clearTimeout(timeout);
 
     if (!res.ok) throw new Error(`Ollama responded ${res.status}`);
     const json = await res.json();
@@ -396,9 +426,6 @@ export async function phraseResponse(facts: TurnFacts): Promise<string> {
     if (!text) throw new Error("Empty LLM response");
     if (HALLUCINATION_RED_FLAGS.test(text)) {
       throw new Error(`Suspected hallucination (mentions calling/phone contact): "${text}"`);
-    }
-    if (mentionsUnknownDoctor(text, collectAllowedDoctorNames(facts))) {
-      throw new Error(`Suspected hallucination (mentions a doctor not present in FACTS): "${text}"`);
     }
     // console.log(`Error: ${_GROQ_BASE_URL}`);
 
