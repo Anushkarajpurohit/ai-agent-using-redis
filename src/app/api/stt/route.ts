@@ -83,7 +83,21 @@ export async function POST(req: NextRequest) {
     console.log(`[STT] transcript: "${transcript}"`);
     return NextResponse.json({ transcript });
   } catch (err) {
-    console.error("[STT] error:", (err as Error).message);
+    const error = err as Error & { cause?: unknown };
+    console.error("[STT] error message:", error?.message);
+    console.error("[STT] error type:", error?.constructor?.name ?? typeof err);
+    console.error("[STT] error stack:", error?.stack);
+    if (error?.cause) {
+      console.error("[STT] error cause:", error.cause);
+    }
+    try {
+      console.error(
+        "[STT] full error (JSON):",
+        JSON.stringify(err, Object.getOwnPropertyNames(err instanceof Error ? err : Object(err)))
+      );
+    } catch (stringifyErr) {
+      console.error("[STT] failed to stringify error:", stringifyErr);
+    }
     return NextResponse.json(
       { transcript: "", error: "STT service unavailable — is the whisper Docker container running?" },
       { status: 503 }
