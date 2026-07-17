@@ -13,7 +13,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const WHISPER_URL =
-  process.env.WHISPER_URL || "http://localhost:8000/v1/audio/transcriptions";
+  process.env.WHISPER_URL || "http://faster-whisper-server.railway.internal:8000/v1/audio/transcriptions";
 
 /**
  * Whisper-family models hallucinate short filler phrases ("Okay.", "All
