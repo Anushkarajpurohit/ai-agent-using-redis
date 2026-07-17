@@ -120,12 +120,26 @@ function monthIndexFromToken(token: string): number {
 export function containsMonthMention(text: string): boolean {
   return MONTH_MENTION_RE.test(text);
 }
+// Words that can immediately follow "doctor"/"dr" in ordinary speech without
+// being a name — "any other doctor available?" was matching "available" as
+// a literal doctor name to search for, producing "I couldn't find a Dr.
+// available in our system."
+const DOCTOR_NAME_FILLER_WORDS = new Set([
+  "available", "free", "there", "here", "open", "around", "today",
+  "tomorrow", "now", "please", "again", "yet", "else", "anyone",
+  "someone", "anybody", "somebody", "nearby",
+]);
+
 export function extractDoctorNameQuery(text: string): string | null {
   // Match "Dr." / "Dr" / "Doctor" followed by one or two name words
   const match = text.match(
     /\b(?:dr\.?|doctor)\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})/i
   );
-  if (match) return match[1].trim();
+  if (match) {
+    const candidate = match[1].trim();
+    const firstWord = candidate.split(/\s+/)[0].toLowerCase();
+    if (!DOCTOR_NAME_FILLER_WORDS.has(firstWord)) return candidate;
+  }
 
   // Match "appointment with <Name>" / "book with <Name>"
   const withMatch = text.match(

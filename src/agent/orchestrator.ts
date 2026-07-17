@@ -625,6 +625,49 @@ async function routeByStage(
         };
       }
 
+      // "Any other doctor available?" / "another doctor?" — the user is
+      // asking whether alternatives exist, not naming an unknown doctor.
+      // Must run before extractDoctorNameQuery below, which was misreading
+      // phrases like "doctor available" as a literal (fictitious) name.
+      if (/\b(other|another|different)\b/i.test(userText)) {
+        const candidates = session.candidateDoctors ?? [];
+
+        // A selection is only ever made once (it moves the session out of
+        // this stage), so at this point the full candidate list is always
+        // "everything we've already offered" — "other" means "is there
+        // anything beyond that list at all".
+        if (candidates.length <= 1) {
+          return {
+            intent: intent as any,
+            stage: "awaiting_doctor_selection",
+            nextStage: "awaiting_doctor_selection",
+            action: "clarify_unknown",
+            data: {
+              reason: "only_doctor_available",
+              doctorName: candidates[0]?.name,
+              specialization: session.specialization,
+            },
+          };
+        }
+
+        return {
+          intent: intent as any,
+          stage: "awaiting_doctor_selection",
+          nextStage: "awaiting_doctor_selection",
+          action: "list_doctors",
+          data: {
+            specialization: session.specialization,
+            doctors: candidates.map((d) => ({
+              id: d.id,
+              name: d.name,
+              qualifications: d.qualifications,
+              yearsExperience: d.yearsExperience,
+              clinicName: d.clinicName,
+            })),
+          },
+        };
+      }
+
       const chosen = resolveDoctorSelection(userText, session.candidateDoctors ?? []);
 
       if (chosen) {

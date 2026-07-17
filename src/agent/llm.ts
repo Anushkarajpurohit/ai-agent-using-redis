@@ -224,6 +224,10 @@ function templateFallback(facts: TurnFacts): string {
       if (d.reason === "no_availability") {
         return `${withDr(d.doctorName)} doesn't have any open slots this week. Would you like to try another doctor?`;
       }
+      if (d.reason === "only_doctor_available") {
+        const spec = d.specialization ? ` ${d.specialization}` : "";
+        return `${withDr(d.doctorName)} is currently the only${spec} doctor we have available. Would you like to book with them, or should I check a different specialty?`;
+      }
       if (d.reason === "no_doctors_for_specialization") {
         return d.confident
           ? `I don't see any doctors available for ${d.specialization} right now. Would you like to try a different concern, or see a general physician instead?`
