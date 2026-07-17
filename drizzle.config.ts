@@ -5,6 +5,6 @@ export default defineConfig({
   out: "./drizzle",
   dialect: "postgresql",
   dbCredentials: {
-    url: "postgresql://postgres:QVpGNIfjgFihQRBRZoeQJVyHbdSgEjBl@hayabusa.proxy.rlwy.net:27620/railway",
+    url: "postgresql://postgres:fWsclhTEgtlqbABIKNIpPbFIIWBXWvJr@tokaido.proxy.rlwy.net:54360/railway",
   },
 });

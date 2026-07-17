@@ -31,17 +31,51 @@ function buildUserPrompt(facts: TurnFacts): string {
   return `FACTS:\n${JSON.stringify(facts, null, 2)}\n\nRespond as Maya, speaking this turn's outcome naturally in 1-3 short sentences.`;
 }
 export async function resolveAmbiguousChoice(
-  facts: TurnFacts,
+  facts: TurnFacts | undefined,
   userText: string,
   kind: "doctor" | "date" | "time",
   options: { label: string; value: string }[]
+): Promise<string | null>;
+export async function resolveAmbiguousChoice(
+  userText: string,
+  kind: "doctor" | "date" | "time",
+  options: { label: string; value: string }[]
+): Promise<string | null>;
+export async function resolveAmbiguousChoice(
+  factsOrUserText: TurnFacts | undefined | string,
+  userTextOrKind: string,
+  kindOrOptions: "doctor" | "date" | "time" | { label: string; value: string }[],
+  options?: { label: string; value: string }[]
 ): Promise<string | null> {
-  if (options.length === 0) return null;
+  let facts: TurnFacts | undefined;
+  let userText: string;
+  let kind: "doctor" | "date" | "time";
+  let resolvedOptions: { label: string; value: string }[];
+
+  if (options !== undefined) {
+    // 4-arg form: resolveAmbiguousChoice(facts, userText, kind, options)
+    facts = factsOrUserText as TurnFacts | undefined;
+    userText = userTextOrKind;
+    kind = kindOrOptions as "doctor" | "date" | "time";
+    resolvedOptions = options;
+  } else {
+    // 3-arg form: resolveAmbiguousChoice(userText, kind, options)
+    facts = undefined;
+    userText = factsOrUserText as string;
+    kind = userTextOrKind as "doctor" | "date" | "time";
+    resolvedOptions = kindOrOptions as { label: string; value: string }[];
+  }
+
+  if (resolvedOptions.length === 0) return null;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), CHOICE_TIMEOUT_MS);
 
   try {
+    const userPrompt = facts
+      ? buildUserPrompt(facts)
+      : `User said: "${userText}". Choose the best matching ${kind} from the list.`;
+
     const res = await fetch(`${_GROQ_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: {
@@ -55,7 +89,7 @@ export async function resolveAmbiguousChoice(
         max_tokens: 120,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: buildUserPrompt(facts) },
+          { role: "user", content: userPrompt },
         ],
       }),
     });
@@ -91,9 +125,9 @@ export async function resolveAmbiguousChoice(
 
     const text: string = json?.choices?.[0]?.message?.content?.trim() ?? "";
     const num = parseInt(text.match(/\d+/)?.[0] ?? "", 10);
-    if (!Number.isNaN(num) && options[num - 1]) {
-      console.log(`[LLM] resolved ambiguous ${kind} choice "${userText}" -> "${options[num - 1].label}"`);
-      return options[num - 1].value;
+    if (!Number.isNaN(num) && resolvedOptions[num - 1]) {
+      console.log(`[LLM] resolved ambiguous ${kind} choice "${userText}" -> "${resolvedOptions[num - 1].label}"`);
+      return resolvedOptions[num - 1].value;
     }
     return null;
   } catch (err) {
