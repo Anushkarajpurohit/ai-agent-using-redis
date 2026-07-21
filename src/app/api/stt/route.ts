@@ -1,19 +1,32 @@
 /**
  * POST /api/stt
  *
- * Accepts a multipart/form-data request with an "audio" blob (WebM/Ogg),
- * proxies it to the local faster-whisper-server (OpenAI-compatible endpoint),
- * and returns { transcript: string }.
+ * Accepts a multipart/form-data request with an "audio" blob (WebM/Ogg) and
+ * returns { transcript: string }.
  *
- * Sidecar: docker run -d --name whisper-server -p 8000:8000 \
- *   -e WHISPER__MODEL=base.en \
- *   fedirz/faster-whisper-server:latest-cpu
+ * Provider selection:
+ *   - If GROQ_API_KEY is set, uses Groq's hosted Whisper endpoint
+ *     (api.groq.com/openai/v1/audio/transcriptions) — free-tier, very low
+ *     latency (Groq's inference hardware), no infra to keep alive. This is
+ *     the primary path in production (Railway) since self-hosting the
+ *     whisper sidecar there has been unreliable.
+ *   - Otherwise falls back to a local/self-hosted OpenAI-compatible whisper
+ *     server via WHISPER_URL, e.g.:
+ *       docker run -d --name whisper-server -p 8000:8000 \
+ *         -e WHISPER__MODEL=base.en \
+ *         fedirz/faster-whisper-server:latest-cpu
  */
 
 import { NextRequest, NextResponse } from "next/server";
 
+const GROQ_API_KEY = process.env.GROQ_API_KEYY;
+const GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
+// whisper-large-v3-turbo: Groq's best latency/accuracy tradeoff for
+// real-time voice — large-v3 accuracy at a fraction of large-v3's latency.
+const GROQ_STT_MODEL = process.env.GROQ_STT_MODEL || "whisper-large-v3-turbo";
+
 const WHISPER_URL =
-  process.env.WHISPER_URL || "http://faster-whisper-server.railway.internal:8000/v1/audio/transcriptions";
+  process.env.WHISPER_URL || "https://faster-whisper-server-production-b4f0.up.railway.app/v1/audio/transcriptions";
 
 /**
  * Whisper-family models hallucinate short filler phrases ("Okay.", "All
@@ -51,25 +64,31 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Missing 'audio' blob" }, { status: 400 });
   }
 
-  // Build a fresh FormData to forward to whisper server
-  const whisperForm = new FormData();
-  whisperForm.append("file", audio, "audio.webm");
-  // "model" field is required by the OpenAI API shape — whisper server ignores it
-  // and uses whatever model it was started with, but the field must be present.
-  whisperForm.append("model", "whisper-1");
-  whisperForm.append("language", process.env.WHISPER_LANGUAGE ?? "en");
-  whisperForm.append("response_format", "json");
+  const useGroq = Boolean(GROQ_API_KEY);
+  const url = useGroq ? GROQ_STT_URL : WHISPER_URL;
+
+  const form = new FormData();
+  form.append("file", audio, "audio.webm");
+  // "model" is required by the OpenAI API shape. The local whisper sidecar
+  // ignores it (runs whatever it was started with) but still needs the
+  // field present; Groq actually dispatches on it, so it must be a real
+  // Groq model id.
+  form.append("model", useGroq ? GROQ_STT_MODEL : "whisper-1");
+  form.append("language", process.env.WHISPER_LANGUAGE ?? "en");
+  form.append("response_format", "json");
 
   try {
-    const res = await fetch(WHISPER_URL, {
+    const res = await fetch(url, {
       method: "POST",
-      body: whisperForm,
+      headers: useGroq ? { Authorization: `Bearer ${GROQ_API_KEY}` } : undefined,
+      body: form,
     });
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      console.error(`[STT] whisper server ${res.status}: ${body}`);
-      throw new Error(`Whisper server returned ${res.status}`);
+
+      console.error(`[STT] ${useGroq ? "Groq" : "whisper server"} ${res.status}: ${body}`);
+      throw new Error(`STT provider returned ${res.status}`);
     }
 
     const data = await res.json();
@@ -80,12 +99,12 @@ export async function POST(req: NextRequest) {
       transcript = "";
     }
 
-    console.log(`[STT] transcript: "${transcript}"`);
+    console.log(`[STT] (${useGroq ? "groq" : "local"}) transcript: "${transcript}"`);
     return NextResponse.json({ transcript });
   } catch (err) {
     console.error("[STT] error:", (err as Error).message);
     return NextResponse.json(
-      { transcript: "", error: "STT service unavailable — is the whisper Docker container running?" },
+      { transcript: "", error: "STT service unavailable" },
       { status: 503 }
     );
   }
